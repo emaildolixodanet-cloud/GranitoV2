@@ -1,0 +1,14 @@
+{
+  "name": "vinted-to-discord",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "1.7.2",
+    "dayjs": "1.11.13",
+    "puppeteer": "22.15.0"
+  }
+}
