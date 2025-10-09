@@ -29,5 +29,5 @@ jobs:
           ONLY_NEWER_HOURS: "24"
           MAX_ITEMS_PER_PROFILE: "20"
         run: |
-          node index.js
+          node index.js 
 
