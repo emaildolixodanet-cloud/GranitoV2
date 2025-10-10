@@ -26,7 +26,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS || secrets.VINTED_PROFILE_URLS }}
-          ONLY_NEWER_HOURS: "24"
+          ONLY_NEWER_HOURS: "0"
           MAX_ITEMS_PER_PROFILE: "30"
-          MAX_NEW_PER_PROFILE: "3"
+          MAX_NEW_PER_PROFILE: "5"
         run: node index.js
