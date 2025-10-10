@@ -20,7 +20,7 @@ jobs:
 
       - name: Install deps
         run: |
-          npm ci || npm i
+          npm install
 
       - name: Run
         env:
