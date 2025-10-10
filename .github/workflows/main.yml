@@ -1,14 +1,15 @@
-name: Vinted to Discord (Node + Puppeteer)
+name: Vinted → Discord (Node + Puppeteer)
 
 on:
-  workflow_dispatch:          # botão "Run workflow"
   schedule:
-    - cron: "*/30 * * * *"    # opcional: corre a cada 30 min
+    - cron: "*/30 * * * *"   # corre a cada 30 minutos (UTC)
+  workflow_dispatch:          # permite correr manualmente
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,14 +20,13 @@ jobs:
           node-version: "20"
 
       - name: Install deps
-        run: |
-          npm install
+        run: npm install
 
       - name: Run
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS || secrets.VINTED_PROFILE_URLS }}
           ONLY_NEWER_HOURS: "24"
-          MAX_ITEMS_PER_PROFILE: "20"
-        run: |
-          node index.js
+          MAX_ITEMS_PER_PROFILE: "30"
+          MAX_NEW_PER_PROFILE: "3"
+        run: node index.js
