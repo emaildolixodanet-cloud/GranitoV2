@@ -1,331 +1,326 @@
-// index.js — Vinted -> Discord (Node + Puppeteer) 100% corrigido
+// index.js – Vinted -> Discord (com fallback DOM) [corrigido: location is not defined]
 
-import fetch from "node-fetch";
-import puppeteer from "puppeteer";
+import fetch from 'node-fetch';
+import puppeteer from 'puppeteer';
 
-const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-if (!WEBHOOK_URL) {
-  console.error("Falta o DISCORD_WEBHOOK_URL (secret)!");
-  process.exit(1);
+const WEBHOOK = process.env.DISCORD_WEBHOOK_URL || '';
+const PROFILE_URLS =
+  (process.env.VINTED_PROFILE_URLS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+const ONLY_NEWER_HOURS = Number(process.env.ONLY_NEWER_HOURS || '24');     // janela de tempo
+const MAX_ITEMS_PER_PROFILE = Number(process.env.MAX_ITEMS_PER_PROFILE || '30');
+const MAX_NEW_PER_PROFILE = Number(process.env.MAX_NEW_PER_PROFILE || '3');
+
+// -------------------------------------------------------
+// Util
+// -------------------------------------------------------
+
+function hoursAgoDate(hours) {
+  const d = new Date();
+  d.setHours(d.getHours() - hours);
+  return d;
 }
 
-const PROFILE_URLS = (process.env.VINTED_PROFILE_URLS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
-if (!PROFILE_URLS.length) {
-  console.error("Falta a variável VINTED_PROFILE_URLS (listagem de perfis, separada por vírgulas).");
-  process.exit(1);
+function agoString(dt) {
+  const diff = Date.now() - dt.getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d`;
 }
 
-// parâmetros
-const ONLY_NEWER_HOURS   = parseInt(process.env.ONLY_NEWER_HOURS || "24", 10);
-const MAX_ITEMS_PER_PROF = parseInt(process.env.MAX_ITEMS_PER_PROFILE || "30", 10);
-const MAX_NEW_PER_PROF   = parseInt(process.env.MAX_NEW_PER_PROFILE || "3", 10);
+async function postDiscord(contentOrEmbed) {
+  try {
+    const payload = typeof contentOrEmbed === 'string'
+      ? { content: contentOrEmbed }
+      : { embeds: [contentOrEmbed] };
 
-// util
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const now  = () => new Date();
-
-// discord helpers
-async function sendDiscord(content) {
-  const res = await fetch(WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(
-      typeof content === "string" ? { content } : content
-    )
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    console.warn("Falha no webhook:", res.status, t);
+    const res = await fetch(WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      console.warn('Discord webhook falhou:', res.status, t?.slice(0, 200));
+    }
+  } catch (err) {
+    console.warn('Discord webhook erro:', err.message);
   }
 }
 
-function buildEmbedFromItem(item) {
-  const title  = item.title || item.brand_title || "Novo artigo";
-  const url    = item.url || item.permalink || item.web_url || "";
-  const price  = item.price || (item.price_numeric ? `${item.price_numeric} €` : "");
-  const size   = item.size || item.size_title || "";
-  const cond   = item.condition || item.condition_title || "";
-  const brand  = item.brand || item.brand_title || "";
+function itemEmbed(item) {
+  const {
+    title = 'Novo artigo',
+    url,
+    price = '',
+    size = '',
+    condition = '',
+    photo1 = '',
+    photo2 = '',
+    createdAt
+  } = item;
 
-  const img1 = item.photos?.[0]?.url || item.photo?.url || item.image_url || null;
-  const img2 = item.photos?.[1]?.url || null;
+  const fields = [];
+  if (price) fields.push({ name: 'Preço', value: price, inline: true });
+  if (size) fields.push({ name: 'Tamanho', value: size, inline: true });
+  if (condition) fields.push({ name: 'Condição', value: condition, inline: true });
+  if (createdAt) fields.push({ name: 'Publicado', value: `${agoString(createdAt)} atrás`, inline: true });
 
-  const lines = [];
-  if (brand) lines.push(`**Marca**: ${brand}`);
-  if (size)  lines.push(`**Tamanho**: ${size}`);
-  if (cond)  lines.push(`**Condição**: ${cond}`);
-  if (price) lines.push(`**Preço**: ${price}`);
-
-  return {
-    username: "Vinted Bot",
-    embeds: [
-      {
-        title,
-        url,
-        description: lines.join("\n") || "Personaliza aqui",
-        color: 0x2f3136,
-        image: img1 ? { url: img1 } : undefined,
-        footer: { text: "Personaliza aqui" }
-      },
-      ...(img2 ? [{
-        description: "—",
-        image: { url: img2 },
-        color: 0x2f3136
-      }] : [])
-    ]
+  const embed = {
+    title: title?.slice(0, 240),
+    url,
+    color: 0x2B7FFF,
+    fields
   };
-}
 
-// --------- tentativas de leitura de items ----------
-
-// 1) API pública (com fallback de idioma/país)
-async function fetchProfileItemsAPI(profileId, perPage = 50) {
-  const base = "https://www.vinted.pt"; // força PT
-  const tries = [
-    `${base}/api/v2/items?user_id=${profileId}&order=newest_first&per_page=${perPage}`,
-    `${base}/api/v2/catalog/items?user_id=${profileId}&order=newest_first&per_page=${perPage}`,
-  ];
-  for (const url of tries) {
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-          "Accept": "application/json, text/plain, */*",
-          "Accept-Language": "pt-PT,pt;q=0.9",
-          "Cache-Control": "no-cache",
-        },
-        redirect: "follow"
-      });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status} => ${txt.slice(0, 200)}`);
-      }
-      const data = await res.json();
-      const arr  = data?.items || data?.catalog_items || data?.data || [];
-      if (Array.isArray(arr) && arr.length) return arr;
-    } catch (err) {
-      console.warn("API falhou:", url, err.message);
+  // 2 imagens (se houverem)
+  const images = [photo1, photo2].filter(Boolean);
+  if (images.length > 0) {
+    embed.thumbnail = { url: images[0] };
+    if (images[1]) {
+      embed.image = { url: images[1] };
     }
   }
+
+  return embed;
+}
+
+// -------------------------------------------------------
+// API tentativas (404/401 ocorre muito na Vinted sem token)
+// -------------------------------------------------------
+
+async function fetchProfileItemsAPI(profileId, perPage = 30) {
+  const urls = [
+    `https://www.vinted.pt/api/v2/items?user_id=${profileId}&order=newest_first&per_page=${perPage}`,
+    `https://www.vinted.pt/api/v2/catalog/items?user_id=${profileId}&order=newest_first&per_page=${perPage}`
+  ];
+
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, {
+        headers: {
+          'Accept': 'application/json, text/plain, */*',
+          'Referer': `https://www.vinted.pt/member/${profileId}`,
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+        }
+      });
+
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+        console.log(`API falhou: ${u} HTTP ${r.status} => ${txt.slice(0, 160)}`);
+        continue;
+      }
+
+      const json = await r.json();
+      const arr = json?.items || json?.catalog_items || [];
+      if (Array.isArray(arr) && arr.length) {
+        return arr.map(x => ({
+          id: x.id,
+          title: x.title || x.description || 'Novo artigo',
+          url: `https://www.vinted.pt/items/${x.id}`,
+          price: x?.price_with_currency || (x?.price ? `${x.price} €` : ''),
+          createdAt: x?.created_at ? new Date(x.created_at) : null,
+          size: (x?.size_title || x?.size) ?? '',
+          condition: x?.status || x?.condition || '',
+          photo1: x?.photo?.url || x?.photos?.[0]?.url || '',
+          photo2: x?.photos?.[1]?.url || ''
+        }));
+      }
+    } catch (err) {
+      console.log('API erro:', err.message);
+    }
+  }
+
   return [];
 }
 
-// 2) DOM do perfil do utilizador
-async function fetchProfileItemsByDOM(browser, profileUrl, maxCount = 50) {
-  const page = await browser.newPage();
-  try {
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
-    );
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "pt-PT,pt;q=0.9"
-    });
+// -------------------------------------------------------
+// DOM fallback (CORREÇÃO: construir URLs dentro do evaluate)
+// -------------------------------------------------------
 
-    await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForSelector("a[href*='/items/']", { timeout: 10000 }).catch(() => {});
+async function fetchProfileItemsByDOM(page, profileUrl, recentSince) {
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // scroll leve
-    await page.evaluate(async () => {
-      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-      for (let i = 0; i < 3; i++) {
-        window.scrollBy(0, document.body.scrollHeight);
-        await sleep(400);
-      }
-    });
+  // Extraímos tudo DENTRO do evaluate (location/document existem lá).
+  const links = await page.evaluate(() => {
+    const aEls = Array.from(document.querySelectorAll('a[href*="/items/"]'));
+    const map = new Map();
 
-    const links = await page.$$eval("a[href*='/items/']", as =>
-      [...new Set(as.map(a => a.href))].slice(0, 200)
-    );
+    for (const a of aEls) {
+      const href = a.getAttribute('href') || '';
+      const match = href.match(/\/items\/(\d+)/);
+      if (!match) continue;
+      const id = match[1];
 
-    const items = [];
-    for (const href of links) {
-      if (items.length >= maxCount) break;
-
-      // dados básicos diretamente do cartão (quando disponíveis)
-      const cardSel = `a[href='${href.replace(location.origin, "")}']`;
-      const baseInfo = await page.$eval(cardSel, el => {
-        const root = el.closest("[data-testid]") || el.parentElement;
-        if (!root) return {};
-        const q = s => root.querySelector(s)?.textContent?.trim() || "";
-        const img = root.querySelector("img")?.src || "";
-        return {
-          url: el.href,
-          title: q("[data-testid*='title'], [title]") || el.title || "",
-          price: q("[data-testid*='price'], [class*='price']"),
-          size:  q("[data-testid*='size'], [class*='size']"),
-          condition: q("[data-testid*='condition']"),
-          image_url: img
-        };
-      }).catch(() => ({ url: href }));
-
-      items.push(baseInfo);
+      // resolver absoluto dentro do browser
+      const abs = new URL(href, document.location.origin).href;
+      // Imagens (até 2)
+      const imgs = Array.from(a.querySelectorAll('img')).map(img => img.src).filter(Boolean);
+      map.set(id, {
+        id,
+        url: abs,
+        title: (a.textContent || 'Novo artigo').trim(),
+        photo1: imgs[0] || '',
+        photo2: imgs[1] || ''
+      });
     }
-    return items;
-  } finally {
-    await page.close().catch(() => {});
-  }
-}
-
-// parse data/hora abrindo página do item (sem waitForTimeout)
-async function isItemRecentByDOM(browser, itemUrl) {
-  const page = await browser.newPage();
-  try {
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
-    );
-    await page.setExtraHTTPHeaders({ "Accept-Language": "pt-PT,pt;q=0.9" });
-
-    await page.goto(itemUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await sleep(700);
-
-    // 1) ISO via <time datetime="...">
-    let iso = await page.$eval("time[datetime]", el => el.getAttribute("datetime")).catch(() => null);
-
-    // 2) fallback “Publicado há …”
-    let rawPublished = null;
-    if (!iso) {
-      rawPublished = await page.$eval("body", el => el.innerText).then(txt => {
-        const m = txt.match(/Publicado(?:\s+em|\s+há)\s*([^\n]+)/i);
-        return m ? m[0] : null;
-      }).catch(() => null);
-    }
-
-    let publishedAt = null;
-    if (iso) {
-      publishedAt = new Date(iso);
-    } else if (rawPublished) {
-      const m = rawPublished.match(/há\s*(\d+)\s*(minuto|minutos|hora|horas|dia|dias)/i);
-      if (m) {
-        const n = parseInt(m[1], 10);
-        const unit = m[2].toLowerCase();
-        const delta =
-          unit.startsWith("minuto") ? n * 60e3 :
-          unit.startsWith("hora")   ? n * 3600e3 :
-                                      n * 86400e3;
-        publishedAt = new Date(Date.now() - delta);
-      }
-    }
-
-    const minDate = new Date(Date.now() - ONLY_NEWER_HOURS * 3600e3);
-    const ok = !!publishedAt && publishedAt >= minDate;
-    return { ok, publishedAt, raw: iso || rawPublished || "" };
-  } finally {
-    await page.close().catch(() => {});
-  }
-}
-
-// ------------ run principal --------------
-
-async function run() {
-  await sendDiscord("✅ Bot ativo! Conexão com o Discord verificada com sucesso 🚀");
-
-  const minDate = new Date(Date.now() - ONLY_NEWER_HOURS * 3600e3);
-  console.log(`🔎 A verificar ${PROFILE_URLS.length} perfis (últimas ${ONLY_NEWER_HOURS}h) ...`);
-
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-    ],
-    defaultViewport: { width: 1280, height: 1200 }
+    return Array.from(map.values());
   });
+
+  // tentar apanhar mais metadados abrindo páginas dos items (limitado)
+  const results = [];
+  for (const l of links.slice(0, MAX_ITEMS_PER_PROFILE)) {
+    try {
+      const p = await page.browser().newPage();
+      await p.goto(l.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+      const meta = await p.evaluate(() => {
+        const txt = sel => (document.querySelector(sel)?.textContent || '').trim();
+
+        // Vinted tem muitos layouts; tentar campos genéricos
+        const title =
+          txt('h1') ||
+          txt('[data-testid="item-title"]') ||
+          txt('[class*="ItemDetails"] h1') ||
+          'Novo artigo';
+
+        const price =
+          txt('[data-testid="item-price"]') ||
+          txt('[class*="price"]') ||
+          '';
+
+        const size =
+          txt('[data-testid="item-attributes"] [class*="size"]') ||
+          txt('[class*="Size"]') || '';
+
+        const condition =
+          txt('[data-testid="item-attributes"] [class*="condition"]') ||
+          txt('[class*="Condition"]') || '';
+
+        // procurar timestamps (nem sempre visível)
+        let createdAt = null;
+        const timeEl = document.querySelector('time[datetime]');
+        if (timeEl?.getAttribute('datetime')) {
+          const d = new Date(timeEl.getAttribute('datetime'));
+          if (!Number.isNaN(d.getTime())) createdAt = d;
+        }
+        return { title, price, size, condition, createdAt };
+      });
+
+      await p.close();
+
+      // filtrar por tempo se conseguirmos o createdAt
+      if (meta.createdAt && recentSince && meta.createdAt < recentSince) {
+        continue;
+      }
+
+      results.push({
+        ...l,
+        title: meta.title || l.title,
+        price: meta.price || '',
+        size: meta.size || '',
+        condition: meta.condition || '',
+        createdAt: meta.createdAt || null
+      });
+    } catch {
+      results.push(l); // pelo menos o link e imagens
+    }
+  }
+
+  return results;
+}
+
+// -------------------------------------------------------
+// RUN
+// -------------------------------------------------------
+
+(async () => {
+  if (!WEBHOOK) {
+    console.log('Falta DISCORD_WEBHOOK_URL');
+    return;
+  }
+  if (!PROFILE_URLS.length) {
+    console.log('Falta VINTED_PROFILE_URLS');
+    return;
+  }
+
+  await postDiscord('✅ Bot ativo! Conexão com o Discord verificada com sucesso 🚀');
+
+  const recentSince = hoursAgoDate(ONLY_NEWER_HOURS);
+  console.log(`🔎 A verificar ${PROFILE_URLS.length} perfis (últimas ${ONLY_NEWER_HOURS}h) ...`);
 
   let totalFound = 0;
   let totalPosted = 0;
 
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
+  });
+  const page = await browser.newPage();
+
   try {
-    for (const profile of PROFILE_URLS) {
-      const profileId = (profile.match(/member\/(\d+)/) || [])[1] || "";
-      console.log(`\n→ Perfil: ${profile}`);
+    for (const profileUrl of PROFILE_URLS) {
+      const idMatch = profileUrl.match(/\/member\/(\d+)/);
+      const profileId = idMatch?.[1] || '';
+      console.log(`→ Perfil: ${profileUrl}`);
+
+      // 1) tentar API
       let items = [];
-
-      // tentar API primeiro
       if (profileId) {
-        items = await fetchProfileItemsAPI(profileId, Math.min(MAX_ITEMS_PER_PROF, 50));
+        items = await fetchProfileItemsAPI(profileId, Math.min(MAX_ITEMS_PER_PROFILE, 50));
       }
 
-      // fallback DOM
-      if (!items?.length) {
-        const domItems = await fetchProfileItemsByDOM(browser, profile, MAX_ITEMS_PER_PROF);
-        items = domItems;
+      // 2) fallback DOM se API vazia
+      if (!items.length) {
+        const byDom = await fetchProfileItemsByDOM(page, profileUrl, recentSince);
+        // Normalizar campos faltantes via DOM
+        items = byDom.map(x => ({
+          ...x,
+          price: x.price || '',
+          size: x.size || '',
+          condition: x.condition || '',
+          createdAt: x.createdAt || null
+        }));
       }
 
-      console.log(`   • Itens captados (pré-filtro): ${items.length}`);
-
-      // enriquecer com links/urls
-      items = items.map(x => ({
-        ...x,
-        url: x.url || x.web_url || x.permalink || x.path ? `https://www.vinted.pt${x.path}` : x.url
-      })).filter(x => !!x.url);
-
-      // ordenar por mais recentes (quando vier de API já está)
-      // aqui só asseguramos não exceder o limite
-      items = items.slice(0, MAX_ITEMS_PER_PROF);
-
-      // filtrar por tempo (até MAX_NEW_PER_PROF)
-      const newOnes = [];
-      for (const it of items) {
-        if (newOnes.length >= MAX_NEW_PER_PROF) break;
-
-        // se já veio com created_at/updated_at da API
-        let publishedAt = null;
-        const createdIso = it.created_at || it.created || it.updated_at || null;
-        if (createdIso) {
-          const d = new Date(createdIso);
-          if (!isNaN(d)) publishedAt = d;
-        }
-
-        if (!publishedAt) {
-          // tentar via DOM abrindo a página do item
-          const chk = await isItemRecentByDOM(browser, it.url);
-          if (chk.ok) {
-            newOnes.push(it);
-          }
-        } else {
-          if (publishedAt >= minDate) newOnes.push(it);
-        }
+      // filtrar por tempo se possível
+      let candidates = items;
+      if (recentSince) {
+        candidates = items.filter(it => !it.createdAt || it.createdAt >= recentSince);
       }
 
-      console.log(`   • Novos (após filtro de ${ONLY_NEWER_HOURS}h): ${newOnes.length}`);
-      totalFound += newOnes.length;
+      console.log(`   • Links via DOM no perfil: ${items.length}`);
+      console.log(`   • Candidatos (após filtro de tempo): ${candidates.length}`);
 
-      // enviar cada um para o Discord
-      for (const it of newOnes) {
-        // garantir 2 imagens se houver
-        if (!it.photos || it.photos.length < 2) {
-          // tenta descobrir uma segunda imagem abrindo a página (opcional)
-          // aqui mantemos simples; o embed aceita 1 ou 2 se existir
-        }
-        const payload = buildEmbedFromItem(it);
-        await sendDiscord(payload);
+      totalFound += candidates.length;
+
+      // publicar no Discord (máximo por perfil)
+      for (const item of candidates.slice(0, MAX_NEW_PER_PROFILE)) {
+        await postDiscord(itemEmbed(item));
         totalPosted++;
-        // para não explodir o rate-limit do webhook
-        await sleep(800);
       }
     }
   } catch (err) {
-    console.error("Erro geral:", err);
-    await sendDiscord(`⚠️ Erro geral: \`${String(err.message || err)}\``);
+    console.error('Erro geral:', err);
+    await postDiscord(`⚠️ Erro geral: \`${(err && err.message) || String(err)}\``);
   } finally {
-    await browser.close().catch(() => {});
+    await browser.close();
   }
 
-  console.log(`\n📦 Resumo: encontrados=${totalFound}, publicados=${totalPosted}`);
-  if (!totalPosted) {
-    await sendDiscord(`ℹ️ Sem novos artigos nas últimas ${ONLY_NEWER_HOURS}h.`);
-  } else {
-    await sendDiscord(`✅ Publicados ${totalPosted} artigo(s) novo(s).`);
+  // resumo
+  console.log(`📦 Resumo: encontrados=${totalFound}, publicados=${totalPosted}`);
+  if (totalPosted === 0) {
+    await postDiscord('ℹ️ Sem novos artigos nas últimas 24h.');
   }
-}
-
-// start
-run().catch(e => {
-  console.error("FATAL:", e);
-});
+})();
