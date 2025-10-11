@@ -2,7 +2,6 @@
 import puppeteer from "puppeteer";
 import { buildDiscordMessageForItem } from "./discordFormat.js";
 
-// fetch: Node 20 já tem fetch global, mas garantimos fallback
 const fetchHttp = (typeof fetch !== "undefined")
   ? fetch
   : (await import("node-fetch")).default;
@@ -10,7 +9,7 @@ const fetchHttp = (typeof fetch !== "undefined")
 // ======================= CONFIG ===========================
 const PROFILES = (process.env.VINTED_PROFILE_URLS || "")
   .split(",")
-  .map(u => u.trim())
+  .map((u) => u.trim())
   .filter(Boolean);
 
 const HOURS = parseInt(process.env.ONLY_NEWER_HOURS || "24", 10);
@@ -75,11 +74,8 @@ async function postToDiscord(item) {
 async function scrapeProfile(browser, url) {
   const page = await browser.newPage();
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  // Espera o carregamento
   await page.waitForSelector("body", { timeout: 30000 }).catch(() => null);
 
-  // Recolhe links dos artigos
   const items = await page.$$eval("a[href*='/items/']", (links) =>
     links.map((a) => a.href)
   );
@@ -96,14 +92,15 @@ async function scrapeProfile(browser, url) {
         const get = (sel) => document.querySelector(sel)?.innerText?.trim() || "";
         const title = get("h1") || document.title;
         const description = get("p") || "";
-        const price = get("data-testid='item-price'") || "";
+        const price = document.querySelector("[data-testid='item-price']")?.innerText || "";
         const imgs = Array.from(document.querySelectorAll("img"))
           .map((i) => i.src)
           .filter((src) => src.includes("https"));
         return {
           title,
-          url: location.href,
+          url: window.location.href,
           description,
+          price,
           photos: imgs.slice(0, 4),
         };
       });
@@ -118,45 +115,8 @@ async function scrapeProfile(browser, url) {
   await page.close();
   return scraped;
 }
-// ================ TESTE MANUAL DE PUBLICAÇÃO ===================
-// ⚠️ Isto serve apenas para testar o visual do webhook.
-// Podes comentar ou apagar depois de veres o resultado no Discord.
 
-if (process.env.TEST_MODE === "true") {
-  const itemTeste = {
-    title: "Camisola Branca Mulher Ralph Lauren Tamanho XL",
-    url: "https://www.vinted.pt/items/123456789-camisola-ralph-lauren-xl",
-    description:
-      "Camisola Polo Ralph Lauren em malha branca, padrão entrançado e logo bordado azul-marinho no peito. Tecido de alta qualidade — ideal para um look casual elegante.",
-    price: "40.00",
-    currency: "EUR",
-    size: "XL / 42 / 14",
-    brand: "Ralph Lauren",
-    condition: "Muito bom",
-    photos: [
-      "https://images.vinted.net/thumbs/f800x800/01_0021b_Vinted_Item1.jpg",
-      "https://images.vinted.net/thumbs/f800x800/02_0021b_Vinted_Item2.jpg",
-      "https://images.vinted.net/thumbs/f800x800/03_0021b_Vinted_Item3.jpg",
-    ],
-    sellerName: "medp1",
-    sellerUrl: "https://www.vinted.pt/member/medp1",
-    sellerAvatar: "https://cdn-icons-png.flaticon.com/512/194/194938.png",
-    createdAt: new Date().toISOString(),
-  };
-
-  console.log("🧪 TESTE: a publicar item de demonstração no Discord...");
-  await postToDiscord(itemTeste);
-  console.log("✅ Teste enviado para o Discord com sucesso!");
-  process.exit(0);
-}
-
-// ======================= EXECUÇÃO NORMAL ===========================
-run().catch((err) => {
-  console.error("Erro fatal:", err);
-  process.exit(1);
-});
-
-// ======================= RUN ===========================
+// ======================= RUN PRINCIPAL ===========================
 async function run() {
   if (!PROFILES.length) {
     console.error("Nenhum perfil configurado!");
@@ -175,7 +135,6 @@ async function run() {
 
   for (const profile of PROFILES) {
     log(`→ Perfil: ${profile}`);
-
     try {
       const items = await scrapeProfile(browser, profile);
       totalEncontrados += items.length;
@@ -195,7 +154,40 @@ async function run() {
   log(`📦 Resumo: encontrados=${totalEncontrados}, publicados=${totalPublicados}`);
 }
 
-run().catch((err) => {
-  console.error("Erro fatal:", err);
-  process.exit(1);
-});
+// ======================= TESTE MANUAL FORÇADO ===========================
+(async () => {
+  const TEST_MODE = true; // força sempre o modo de teste
+
+  if (TEST_MODE) {
+    const itemTeste = {
+      title: "Camisola Branca Mulher Ralph Lauren Tamanho XL",
+      url: "https://www.vinted.pt/items/123456789-camisola-ralph-lauren-xl",
+      description:
+        "Camisola Polo Ralph Lauren em malha branca, padrão entrançado e logo bordado azul-marinho no peito. Tecido de alta qualidade — ideal para um look casual elegante.",
+      price: "40.00",
+      currency: "EUR",
+      size: "XL / 42 / 14",
+      brand: "Ralph Lauren",
+      condition: "Muito bom",
+      photos: [
+        "https://images.vinted.net/thumbs/f800x800/01_0021b_Vinted_Item1.jpg",
+        "https://images.vinted.net/thumbs/f800x800/02_0021b_Vinted_Item2.jpg",
+        "https://images.vinted.net/thumbs/f800x800/03_0021b_Vinted_Item3.jpg",
+      ],
+      sellerName: "medp1",
+      sellerUrl: "https://www.vinted.pt/member/medp1",
+      sellerAvatar: "https://cdn-icons-png.flaticon.com/512/194/194938.png",
+      createdAt: new Date().toISOString(),
+    };
+
+    console.log("🧪 TESTE FORÇADO: a publicar item de demonstração no Discord...");
+    await postToDiscord(itemTeste);
+    console.log("✅ Teste enviado para o Discord com sucesso!");
+    process.exit(0);
+  } else {
+    await run().catch((err) => {
+      console.error("Erro fatal:", err);
+      process.exit(1);
+    });
+  }
+})();
