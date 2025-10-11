@@ -3,6 +3,9 @@
 import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 
+// ---- helper para substituir page.waitForTimeout ----
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL || '';
 const PROFILE_URLS =
   (process.env.VINTED_PROFILE_URLS || '')
@@ -86,20 +89,19 @@ function itemEmbed(item) {
 async function autoScroll(page, maxSteps = 12, step = 1200, delay = 400) {
   for (let i = 0; i < maxSteps; i++) {
     await page.evaluate((s) => window.scrollBy(0, s), step);
-    await page.waitForTimeout(delay);
+    await sleep(delay);
   }
 }
 
 async function acceptCookiesIfAny(page) {
   try {
-    // tentar alguns seletores/strings comuns
     await page.evaluate(() => {
       const texts = ['Aceitar tudo', 'Aceitar', 'Accept all', 'Tout accepter'];
       const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
       const btn = buttons.find(b => texts.some(t => (b.textContent || '').trim().includes(t)));
       btn?.click();
     });
-    await page.waitForTimeout(800);
+    await sleep(800);
   } catch {}
 }
 
@@ -118,7 +120,7 @@ async function fetchProfileItemsByDOM(page, profileUrl, recentSince) {
   await acceptCookiesIfAny(page);
 
   // aguardar que a página carregue alguma coisa
-  await page.waitForTimeout(1500);
+  await sleep(1500);
 
   // scroll para forçar carregamento
   await autoScroll(page, 10, 1400, 350);
@@ -169,7 +171,7 @@ async function fetchProfileItemsByDOM(page, profileUrl, recentSince) {
       await p.setExtraHTTPHeaders({ 'Accept-Language': 'pt-PT,pt;q=0.9,en;q=0.8' });
       await p.goto(l.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await acceptCookiesIfAny(p);
-      await p.waitForTimeout(800);
+      await sleep(800);
 
       const meta = await p.evaluate(() => {
         const get = sel => (document.querySelector(sel)?.textContent || '').trim();
@@ -267,10 +269,8 @@ async function fetchProfileItemsByDOM(page, profileUrl, recentSince) {
     for (const profileUrl of PROFILE_URLS) {
       console.log(`→ Perfil: ${profileUrl}`);
 
-      // API geralmente falha sem token => ignoramos e vamos direto ao DOM robusto
       const items = await fetchProfileItemsByDOM(page, profileUrl, recentSince);
 
-      // filtrar por tempo se possível (se não souber, não corta)
       const candidates = items.filter(it => !it.createdAt || it.createdAt >= recentSince);
 
       console.log(`   • Links via DOM no perfil: ${items.length}`);
