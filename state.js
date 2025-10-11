@@ -1,65 +1,60 @@
-// state.js
+// state.js — persistência anti-duplicados entre execuções via artifact
 import fs from "fs";
-import path from "path";
 
-const STATE_PATH = path.resolve(".github/vinted_state.json");
+export const STATE_PATH = "./vinted_state.json";
 
-// estrutura: { posted: { "<id>": 1733910060, ... } }  // timestamp unix
-const DEFAULT_STATE = { posted: {} };
-
-function ensureStateFile() {
-  if (!fs.existsSync(path.dirname(STATE_PATH))) {
-    fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-  }
-  if (!fs.existsSync(STATE_PATH)) {
-    fs.writeFileSync(STATE_PATH, JSON.stringify(DEFAULT_STATE, null, 2));
-  }
-}
-
+// Carrega estado do disco (se não existir, cria um default)
 export function loadState() {
   try {
-    ensureStateFile();
+    if (!fs.existsSync(STATE_PATH)) {
+      return { posted: {}, lastPrune: Date.now() };
+    }
     const raw = fs.readFileSync(STATE_PATH, "utf8");
-    const json = JSON.parse(raw || "{}");
-    return { ...DEFAULT_STATE, ...json };
+    const data = JSON.parse(raw);
+    if (!data.posted) data.posted = {};
+    return data;
   } catch {
-    return { ...DEFAULT_STATE };
+    return { posted: {}, lastPrune: Date.now() };
   }
 }
 
+// Salva estado no disco
 export function saveState(state) {
-  ensureStateFile();
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-}
-
-// ID estável do item (usa o número do /items/ ou, em último caso, a URL)
-export function extractItemId(item) {
-  if (!item) return null;
-  if (item.id) return String(item.id);
-  if (item.url) {
-    const m = item.url.match(/\/items\/(\d+)/);
-    if (m) return m[1];
-    return item.url;
+  try {
+    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  } catch (e) {
+    console.error("Falha a gravar estado:", e.message);
   }
-  return null;
 }
 
+// Gera um ID estável para o item (usa URL; se existir itemId, melhor ainda)
+export function itemId(item) {
+  // captura o /items/123456789 da URL, se existir
+  const m = item.url?.match(/\/items\/(\d+)/);
+  if (m) return m[1];
+  return item.url || item.title || String(Math.random());
+}
+
+// Já foi publicado?
 export function wasPosted(state, item) {
-  const id = extractItemId(item);
-  if (!id) return false;
+  const id = itemId(item);
   return Boolean(state.posted[id]);
 }
 
+// Marca como publicado agora
 export function markPosted(state, item) {
-  const id = extractItemId(item);
-  if (!id) return;
-  state.posted[id] = Math.floor(Date.now() / 1000);
+  const id = itemId(item);
+  state.posted[id] = Date.now();
 }
 
-// limpeza opcional: remove IDs com mais de X dias para o ficheiro não crescer para sempre
-export function pruneOld(state, days = 14) {
-  const cutoff = Math.floor(Date.now() / 1000) - days * 24 * 3600;
+// Limpa IDs antigos (ex.: manter 14 dias)
+export function pruneOld(state, keepDays = 14) {
+  const maxAge = keepDays * 24 * 60 * 60 * 1000;
+  const now = Date.now();
   for (const [id, ts] of Object.entries(state.posted)) {
-    if (ts < cutoff) delete state.posted[id];
+    if (!ts || now - ts > maxAge) {
+      delete state.posted[id];
+    }
   }
+  state.lastPrune = now;
 }
