@@ -3,16 +3,13 @@ import fs from "fs/promises";
 import puppeteer from "puppeteer";
 import { buildDiscordMessageForItem } from "./discordFormat.js";
 
-// fetch (fallback)
 const fetchHttp = (typeof fetch !== "undefined")
   ? fetch
   : (await import("node-fetch")).default;
 
 // ======================= CONFIG ===========================
 const PROFILES = (process.env.VINTED_PROFILE_URLS || "")
-  .split(",")
-  .map(u => u.trim())
-  .filter(Boolean);
+  .split(",").map(u => u.trim()).filter(Boolean);
 
 const HOURS = parseInt(process.env.ONLY_NEWER_HOURS || "24", 10);
 const MAX_ITEMS_PER_PROFILE = parseInt(process.env.MAX_ITEMS_PER_PROFILE || "20", 10);
@@ -52,7 +49,7 @@ const short = (t, m = 250) => {
 };
 const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000);
 
-// “há 35 minutos”, “há 5 dias”, “há 1 hora”, “há uma hora”
+// “há 35 minutos”, “há 5 dias”, “há 1 hora”
 function parseRelativePt(text) {
   if (!text) return null;
   const t = text.toLowerCase();
@@ -92,6 +89,13 @@ async function ensureAtLeastOneItemLink(page, timeoutMs = 10000) {
 }
 
 // ======================= SCRAPERS ===========================
+function pickFromSrcset(srcset) {
+  if (!srcset) return null;
+  // pega o último URL (normalmente o maior)
+  const parts = srcset.split(",").map(s => s.trim().split(" ")[0]).filter(Boolean);
+  return parts[parts.length - 1] || parts[0] || null;
+}
+
 async function scrapeProfile(browser, url) {
   const page = await browser.newPage();
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -125,98 +129,121 @@ async function scrapeItem(browser, link) {
   await autoScroll(page, 2, 800, 150);
 
   const data = await page.evaluate(() => {
+    const getMeta = (prop) =>
+      document.querySelector(`meta[property="${prop}"]`)?.getAttribute("content") ||
+      document.querySelector(`meta[name="${prop}"]`)?.getAttribute("content") ||
+      "";
+
     const sidebar = document.querySelector('[data-testid="sidebar"]') || document;
+    const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+
     const textOf = (sel, root = document) => root.querySelector(sel)?.textContent?.trim() || "";
 
     // Título
     const title = textOf("h1") || document.title || "";
 
-    // Descrição (backup)
-    let description = "";
-    const descNode = sidebar.querySelector("p, div[data-testid='item-description']");
-    if (descNode) description = descNode.textContent.trim();
+    // Descrição (backup, não vamos mostrar por enquanto)
+    const description = "";
 
-    // Painel de texto inteiro para regex
-    const sidebarText = (sidebar.innerText || "")
-      .replace(/\s+/g, " ")
-      .replace(/[,](\d{3})\b/g, ".$1"); // normaliza “1,000” -> “1.000” (por segurança)
-
-    // ===== PREÇO ROBUSTO =====
+    // ===== PREÇO SUPER ROBUSTO =====
     let price = "";
     let currency = "";
 
-    // 1) € 51,00   |  £ 20.00  |  $ 15.50
-    let m = sidebarText.match(/[€£$]\s*\d[\d.,]*/);
-    if (m) {
-      currency = m[0][0] === "€" ? "EUR" : (m[0][0] === "£" ? "GBP" : "USD");
-      price = m[0].replace(/[€£$\s]/g, "").trim();
+    // 1) meta tags (mais confiável)
+    const metaAmount = getMeta("product:price:amount") || getMeta("og:price:amount");
+    const metaCurrency = getMeta("product:price:currency") || getMeta("og:price:currency");
+    if (metaAmount) {
+      price = metaAmount.trim();
+      currency = (metaCurrency || "EUR").trim();
     } else {
-      // 2) 51,00 €   |  51 EUR
-      m = sidebarText.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
+      // 2) número + símbolo (variações)
+      const sidebarText = (sidebar.innerText || "").replace(/\s+/g, " ");
+      let m =
+        sidebarText.match(/[€£$]\s*\d[\d.,]*/) ||
+        sidebarText.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
       if (m) {
-        const parts = m[0].trim().split(/\s+/);
-        price = parts[0];
-        const cur = parts[1].toUpperCase();
-        currency = cur === "€" ? "EUR" : cur;
+        const s = m[0];
+        if (/^[€£$]/.test(s)) {
+          currency = s[0] === "€" ? "EUR" : (s[0] === "£" ? "GBP" : "USD");
+          price = s.replace(/[€£$\s]/g, "");
+        } else {
+          const parts = s.trim().split(/\s+/);
+          price = parts[0];
+          const cur = parts[1].toUpperCase();
+          currency = cur === "€" ? "EUR" : cur;
+        }
       }
     }
 
-    // Fotos
-    const photos = Array.from(document.querySelectorAll("img"))
-      .map(i => i.getAttribute("src") || i.getAttribute("data-src") || "")
-      .filter(u => u && /^https?:\/\//i.test(u));
-
-    // Campo utilitário para pares "Label -> Valor"
-    const getLabeledValue = (label) => {
-      const row = Array.from(sidebar.querySelectorAll("div,li,dt,section")).find(el =>
-        el.textContent.trim().toLowerCase().startsWith(label.toLowerCase())
-      );
-      if (!row) return "";
-
-      // prioridade: links (marca costuma ser link)
-      const a = row.querySelector("a");
-      if (a && a.textContent) return a.textContent.trim();
-
-      // senão, encontra o nó do label e lê o irmão
-      const labEl = Array.from(row.querySelectorAll("span,div,dt")).find(
+    // ===== MARCA / TAMANHO / ESTADO / "Carregado há …" =====
+    const findLabeled = (label) => {
+      const root = sidebar;
+      // tenta linhas onde o label aparece e o valor vem a seguir
+      const rows = Array.from(root.querySelectorAll("div,li,dt,section"));
+      const target = rows.find(el => el.textContent.trim().toLowerCase().startsWith(label.toLowerCase()));
+      if (!target) return "";
+      const a = target.querySelector("a");
+      if (a?.textContent) return a.textContent.trim();
+      // procura o nó exacto do label e lê o irmão
+      const labEl = Array.from(target.querySelectorAll("span,div,dt")).find(
         el => el.textContent.trim().toLowerCase() === label.toLowerCase()
       );
-      if (labEl?.nextElementSibling?.textContent) {
+      if (labEl?.nextElementSibling?.textContent)
         return labEl.nextElementSibling.textContent.trim();
-      }
-
-      // fallback: remove o label do texto
-      return row.textContent.replace(new RegExp("^" + label, "i"), "").trim();
+      // fallback: remove label do texto
+      return target.textContent.replace(new RegExp("^" + label, "i"), "").trim();
     };
 
-    // Marca (limpa “Menu da marca”)
-    let brand = getLabeledValue("Marca")
-      .replace(/Menu da marca/gi, "")
-      .split("\n")[0]
-      .trim();
+    let brand = findLabeled("Marca").replace(/Menu da marca/gi, "").split("\n")[0].trim();
+    const size = findLabeled("Tamanho");
+    const condition = findLabeled("Estado");
+    const loadedAgo = findLabeled("Carregado");
 
-    // Tamanho / Estado / “Carregado há …”
-    const size = getLabeledValue("Tamanho");
-    const condition = getLabeledValue("Estado");
-    const loadedAgo = getLabeledValue("Carregado"); // ex: "há 35 minutos"
+    // ===== FEEDBACKS (opiniões do vendedor) =====
+    // procura por algo tipo "Feedbacks (12)" / "Opiniões (3)" no texto do sidebar/body
+    let feedbacks = null;
+    const fbMatch =
+      bodyText.match(/(Feedbacks|Opiniões|Avaliações)\s*\((\d+)\)/i) ||
+      bodyText.match(/⭐\s*\((\d+)\)/i);
+    if (fbMatch) {
+      feedbacks = parseInt(fbMatch[2] || fbMatch[1], 10);
+      if (Number.isNaN(feedbacks)) feedbacks = null;
+    }
+
+    // ===== FOTOS (tenta srcset + og:image) =====
+    const urls = new Set();
+
+    // meta og:image
+    const ogImage = getMeta("og:image");
+    if (ogImage) urls.add(ogImage);
+
+    // imagens da galeria
+    document.querySelectorAll("img").forEach(img => {
+      const srcset = img.getAttribute("srcset") || img.getAttribute("data-srcset");
+      if (srcset) {
+        const candidate = srcset.split(",").map(s => s.trim().split(" ")[0]).filter(Boolean).pop();
+        if (candidate && /^https?:\/\//i.test(candidate)) urls.add(candidate);
+      }
+      const src = img.getAttribute("src") || img.getAttribute("data-src");
+      if (src && /^https?:\/\//i.test(src)) urls.add(src);
+    });
 
     return {
       title,
       url: location.href,
       description,
-      price, currency,
-      brand, size, condition,
+      price: price ? price.replace(/\s/g, "") : "",
+      currency,
+      brand,
+      size,
+      condition,
       loadedAgo,
-      photos: Array.from(new Set(photos)).slice(0, 6),
+      feedbacks,
+      photos: Array.from(urls).slice(0, 6),
     };
   });
 
   await page.close();
-
-  // Normalização extra do preço (substitui vírgula por ponto só para consistência; mantém original para visual)
-  if (data && data.price) {
-    data.price = data.price.replace(/\s/g, "");
-  }
 
   return data;
 }
@@ -271,15 +298,14 @@ async function run() {
         await postToDiscord({
           ...item,
           description: short(item.description, 280),
-          photos: (item.photos || []).slice(0, 3), // 1 thumb no principal + 2 thumbs extra
+          photos: (item.photos || []).slice(0, 3), // 1 + 2 thumbs
         });
 
-        // marca como publicado
         state.posted[item.url] = { ts: Date.now() };
         await saveState(state);
 
         totalPublicados++;
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 800));
       }
     } catch (err) {
       log("Erro geral:", err.message);
