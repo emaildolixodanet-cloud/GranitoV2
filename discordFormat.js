@@ -1,68 +1,90 @@
-// Gera payload com 1 embed principal + até 2 imagens extra (total 3 imagens)
+// discordFormat.js
+//
+// Gera a mensagem do Discord exatamente como pediste:
+// - Sem descrição no embed principal
+// - Campos: Preço, Tamanho, Marca, Estado, Feedbacks (opcional)
+// - Botão único "Comprar no Vinted"
+// - Até 3 imagens (1 principal no 1º embed + 2 imagens extra em embeds seguintes)
+// - Rodapé fixo: "Comunidade GRANITO • Vinted Updates"
+
+function fmtPrice(price, currency) {
+  if (!price) return null;
+  // Se vier numérico/float, normaliza para string com 2 casas
+  const p = typeof price === "number" ? price.toFixed(2) : String(price);
+  const cur = (currency || "EUR").toUpperCase();
+  const symbol = cur === "EUR" ? "€" : cur; // simples: € para EUR, caso contrário mostra o código
+  // se já vier "19.99 €" não duplica
+  if (/\€|EUR|USD|GBP/i.test(p)) return p;
+  return `${p} ${symbol}`;
+}
+
 export function buildDiscordMessageForItem(item) {
-  const photos = Array.isArray(item.photos) ? item.photos.filter(Boolean) : [];
-  const mainImg = photos[0];
-  const extra = photos.slice(1, 3); // até 2 imagens adicionais
+  const {
+    title,
+    url,
+    photos = [],
+    price,
+    currency,
+    size,
+    brand,
+    condition,
+    sellerFeedbackCount, // número de opiniões/feedbacks do vendedor (opcional)
+  } = item || {};
 
-  const fields = [];
-
-  if (item.price) {
-    fields.push({
-      name: "💰 Preço",
-      value: `${item.price} ${item.currency || "€"}`,
-      inline: true,
-    });
-  }
-  if (item.brand) {
-    fields.push({
-      name: "🏷️ Marca",
-      value: item.brand,
-      inline: true,
-    });
-  }
-  if (item.size) {
-    fields.push({
-      name: "📐 Tamanho",
-      value: item.size,
-      inline: true,
-    });
-  }
-  if (item.condition) {
-    fields.push({
-      name: "💎 Estado",
-      value: item.condition,
-      inline: true,
-    });
-  }
-
+  // 1) EMBED PRINCIPAL (título, campos e imagem grande)
   const mainEmbed = {
-    author: item.sellerName
-      ? {
-          name: item.sellerName,
-          url: item.sellerUrl || undefined,
-          icon_url: item.sellerAvatar || undefined,
-        }
-      : undefined,
-    title: item.title || "Novo artigo",
-    url: item.url,
-    description: item.description ? item.description.toString().slice(0, 600) : "",
-    color: 0x2b2d31,
-    fields,
-    image: mainImg ? { url: mainImg } : undefined,
-    footer: {
-      text:
-        "Vinted • Clique no título para abrir" +
-        (item.createdAt ? ` • ${new Date(item.createdAt).toLocaleString("pt-PT")}` : ""),
-    },
+    type: "rich",
+    title: title || "Novo artigo no Vinted",
+    url: url || undefined,
+    // descrição removida como pedido (sem texto)
+    description: undefined,
+    fields: [
+      price ? { name: "💰 Preço", value: fmtPrice(price, currency), inline: true } : null,
+      size ? { name: "📐 Tamanho", value: String(size), inline: true } : null,
+      brand ? { name: "🏷️ Marca", value: String(brand), inline: true } : null,
+      condition ? { name: "✨ Estado", value: String(condition), inline: true } : null,
+      (typeof sellerFeedbackCount === "number")
+        ? { name: "⭐ Feedbacks", value: `${sellerFeedbackCount}`, inline: true }
+        : null,
+    ].filter(Boolean),
+    image: photos[0] ? { url: photos[0] } : undefined,
+    footer: { text: "Comunidade GRANITO • Vinted Updates • Sellers Oficiais" },
   };
 
-  const galleryEmbeds = extra.map((url) => ({
-    url: item.url,
-    image: { url },
-    color: 0x2b2d31,
-  }));
+  // 2) IMAGENS EXTRA (até 2)
+  const extraImageEmbeds = [];
+  if (photos.length > 1) {
+    const extras = photos.slice(1, 3); // no máximo mais 2
+    for (const img of extras) {
+      extraImageEmbeds.push({
+        type: "image",
+        image: { url: img },
+      });
+    }
+  }
+
+  // 3) BOTÃO ÚNICO: COMPRAR
+  const components = [];
+  if (url) {
+    components.push({
+      type: 1, // action row
+      components: [
+        {
+          type: 2,          // button
+          style: 5,         // link button
+          label: "🛒 Comprar no Vinted",
+          url,
+        },
+      ],
+    });
+  }
 
   return {
-    embeds: [mainEmbed, ...galleryEmbeds],
+    username: "Vinted Bot",
+    avatar_url: "https://cdn-icons-png.flaticon.com/512/825/825500.png",
+    embeds: [mainEmbed, ...extraImageEmbeds],
+    components,
   };
 }
+
+export default buildDiscordMessageForItem;
