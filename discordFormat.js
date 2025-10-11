@@ -1,9 +1,15 @@
 // discordFormat.js
 export function buildDiscordMessageForItem(item) {
   const safe = (v, dash = "—") => (v && String(v).trim()) ? String(v).trim() : dash;
-  const priceText = item.price
-    ? `${item.price}${item.currency ? " " + item.currency : ""}`.trim()
-    : "";
+
+  // mostrar preço exatamente como veio (mantendo vírgulas), mas garante a moeda
+  let priceText = "";
+  if (item.priceText) {
+    priceText = item.priceText;
+  } else if (item.price) {
+    const p = String(item.price).replace(/\./g, ","); // preferir vírgula pt
+    priceText = item.currency ? `${p} ${item.currency}` : p;
+  }
 
   const fields = [
     { name: "💰 Preço",   value: safe(priceText), inline: true },
@@ -12,24 +18,20 @@ export function buildDiscordMessageForItem(item) {
     { name: "✨ Estado",  value: safe(item.condition) },
   ];
 
-  // feedbacks (se disponível)
   if (typeof item.feedbacks === "number") {
     fields.push({ name: "⭐ Opiniões", value: `${item.feedbacks}`, inline: true });
   }
 
-  // Embed principal só com THUMB pequeno
   const main = {
     title: safe(item.title, "Novo artigo na Vinted"),
     url: item.url,
     fields,
     thumbnail: item.photos?.[0] ? { url: item.photos[0] } : undefined,
-    footer: {
-      text: "Comunidade GRANITO • Vinted Updates • Sellers Oficiais",
-    },
+    footer: { text: "Comunidade GRANITO • Vinted Updates • Sellers Oficiais" },
     timestamp: item.createdAt || new Date().toISOString(),
   };
 
-  // +2 thumbs pequenos (sem imagem gigante)
+  // 2 thumbs pequenos adicionais
   const extraThumbs = (item.photos || [])
     .slice(1, 3)
     .map((url) => ({
@@ -48,9 +50,5 @@ export function buildDiscordMessageForItem(item) {
     },
   ];
 
-  return {
-    username: "Bot Vinted",
-    embeds: [main, ...extraThumbs],
-    components,
-  };
+  return { username: "Bot Vinted", embeds: [main, ...extraThumbs], components };
 }
