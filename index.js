@@ -1,4 +1,3 @@
-// ======================= IMPORTS E SETUP ===========================
 import fs from "fs/promises";
 import puppeteer from "puppeteer";
 import { buildDiscordMessageForItem } from "./discordFormat.js";
@@ -7,7 +6,6 @@ const fetchHttp = (typeof fetch !== "undefined")
   ? fetch
   : (await import("node-fetch")).default;
 
-// ======================= CONFIG ===========================
 const PROFILES = (process.env.VINTED_PROFILE_URLS || "")
   .split(",").map(u => u.trim()).filter(Boolean);
 
@@ -17,7 +15,6 @@ const MAX_NEW_PER_PROFILE = parseInt(process.env.MAX_NEW_PER_PROFILE || "5", 10)
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const STATE_PATH = "vinted_state.json";
 
-// ======================= STATE (ANTI-DUPLICAÇÃO) ===================
 async function loadState() {
   try {
     const raw = await fs.readFile(STATE_PATH, "utf8");
@@ -40,7 +37,6 @@ function pruneState(state, days = 14) {
   state.lastPrune = now;
 }
 
-// ======================= HELPERS ===========================
 const log = (...a) => console.log(...a);
 const short = (t, m = 250) => {
   if (!t) return "";
@@ -49,15 +45,12 @@ const short = (t, m = 250) => {
 };
 const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000);
 
-// “há 35 minutos”, “há 5 dias”, “há 1 hora”
 function parseRelativePt(text) {
   if (!text) return null;
   const t = text.toLowerCase();
-
   if (/há\s+um(a)?\s+min/.test(t)) return new Date(Date.now() - 1 * 60 * 1000);
   if (/há\s+um(a)?\s+hora/.test(t)) return new Date(Date.now() - 1 * 3600 * 1000);
   if (/há\s+um(a)?\s+dia/.test(t)) return new Date(Date.now() - 24 * 3600 * 1000);
-
   let m;
   if ((m = t.match(/há\s+(\d+)\s+min/)))   return new Date(Date.now() - parseInt(m[1], 10) * 60 * 1000);
   if ((m = t.match(/há\s+(\d+)\s+hora/)))  return new Date(Date.now() - parseInt(m[1], 10) * 3600 * 1000);
@@ -75,7 +68,6 @@ async function postToDiscord(item) {
   });
 }
 
-// ======================= PUPPETEER UTILS ===========================
 async function autoScroll(page, steps = 10, stepPx = 1200, delayMs = 300) {
   for (let i = 0; i < steps; i++) {
     await page.evaluate(y => window.scrollBy(0, y), stepPx);
@@ -86,14 +78,6 @@ async function autoScroll(page, steps = 10, stepPx = 1200, delayMs = 300) {
 }
 async function ensureAtLeastOneItemLink(page, timeoutMs = 10000) {
   try { await page.waitForSelector('a[href*="/items/"]', { timeout: timeoutMs }); } catch {}
-}
-
-// ======================= SCRAPERS ===========================
-function pickFromSrcset(srcset) {
-  if (!srcset) return null;
-  // pega o último URL (normalmente o maior)
-  const parts = srcset.split(",").map(s => s.trim().split(" ")[0]).filter(Boolean);
-  return parts[parts.length - 1] || parts[0] || null;
 }
 
 async function scrapeProfile(browser, url) {
@@ -138,69 +122,120 @@ async function scrapeItem(browser, link) {
     const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
 
     const textOf = (sel, root = document) => root.querySelector(sel)?.textContent?.trim() || "";
-
-    // Título
     const title = textOf("h1") || document.title || "";
 
-    // Descrição (backup, não vamos mostrar por enquanto)
-    const description = "";
-
-    // ===== PREÇO SUPER ROBUSTO =====
-    let price = "";
+    // ---------- PREÇO: várias estratégias ----------
+    let price = "";         // numérico (string)
+    let priceText = "";     // como aparece na UI (mantém vírgula/símbolo)
     let currency = "";
 
-    // 1) meta tags (mais confiável)
-    const metaAmount = getMeta("product:price:amount") || getMeta("og:price:amount");
-    const metaCurrency = getMeta("product:price:currency") || getMeta("og:price:currency");
-    if (metaAmount) {
-      price = metaAmount.trim();
-      currency = (metaCurrency || "EUR").trim();
-    } else {
-      // 2) número + símbolo (variações)
-      const sidebarText = (sidebar.innerText || "").replace(/\s+/g, " ");
-      let m =
-        sidebarText.match(/[€£$]\s*\d[\d.,]*/) ||
-        sidebarText.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
+    // (A) JSON-LD
+    try {
+      const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+        .map(s => s.textContent)
+        .filter(Boolean)
+        .map(t => { try { return JSON.parse(t); } catch { return null; } })
+        .filter(Boolean);
+      for (const blob of ld) {
+        const arr = Array.isArray(blob) ? blob : [blob];
+        for (const obj of arr) {
+          if (obj?.['@type'] === 'Product') {
+            const offers = Array.isArray(obj.offers) ? obj.offers : (obj.offers ? [obj.offers] : []);
+            const off = offers.find(o => o.price);
+            if (off?.price) {
+              price = String(off.price);
+              currency = (off.priceCurrency || "EUR").toUpperCase();
+              priceText = off.priceCurrency ? `${off.price} ${off.priceCurrency}` : String(off.price);
+              break;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // (B) Next.js data / scripts com "price"
+    if (!price) {
+      const scripts = Array.from(document.querySelectorAll("script"))
+        .map(s => s.textContent || "")
+        .filter(t => /price/i.test(t) && t.length < 2_000_000);
+      for (const t of scripts) {
+        let m = t.match(/"price"\s*:\s*"?(?<p>[\d.,]+)"?/i);
+        if (m?.groups?.p) {
+          price = m.groups.p;
+          const c = t.match(/"currency"\s*:\s*"(?<c>[A-Z]{3})"/i)?.groups?.c;
+          currency = (c || "EUR").toUpperCase();
+          break;
+        }
+      }
+    }
+
+    // (C) Meta tags
+    if (!price) {
+      const metaAmount = getMeta("product:price:amount") || getMeta("og:price:amount");
+      const metaCurrency = getMeta("product:price:currency") || getMeta("og:price:currency");
+      if (metaAmount) {
+        price = metaAmount.trim();
+        currency = (metaCurrency || "EUR").trim().toUpperCase();
+      }
+    }
+
+    // (D) Selectores visíveis (botões/etiquetas)
+    if (!price) {
+      const sideTxt = (sidebar.innerText || "").replace(/\s+/g, " ");
+      // € 19,99  |  19,99 €  |  19,99 EUR
+      let m = sideTxt.match(/[€£$]\s*\d[\d.,]*/) ||
+              sideTxt.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
+      if (!m) {
+        // tenta no botão de comprar
+        const btnTxt = Array.from(document.querySelectorAll("button, a"))
+          .map(el => el.textContent?.replace(/\s+/g, " ").trim() || "")
+          .filter(Boolean)
+          .join(" | ");
+        m = btnTxt.match(/[€£$]\s*\d[\d.,]*/) ||
+            btnTxt.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
+      }
       if (m) {
         const s = m[0];
+        priceText = s;
         if (/^[€£$]/.test(s)) {
           currency = s[0] === "€" ? "EUR" : (s[0] === "£" ? "GBP" : "USD");
           price = s.replace(/[€£$\s]/g, "");
         } else {
           const parts = s.trim().split(/\s+/);
           price = parts[0];
-          const cur = parts[1].toUpperCase();
+          const cur = (parts[1] || "").toUpperCase();
           currency = cur === "€" ? "EUR" : cur;
         }
       }
     }
 
-    // ===== MARCA / TAMANHO / ESTADO / "Carregado há …" =====
-    const findLabeled = (label) => {
+    // ---------- MARCA / TAMANHO / ESTADO / CARREGADO ----------
+    const findRowValue = (label) => {
       const root = sidebar;
-      // tenta linhas onde o label aparece e o valor vem a seguir
       const rows = Array.from(root.querySelectorAll("div,li,dt,section"));
       const target = rows.find(el => el.textContent.trim().toLowerCase().startsWith(label.toLowerCase()));
       if (!target) return "";
-      const a = target.querySelector("a");
-      if (a?.textContent) return a.textContent.trim();
-      // procura o nó exacto do label e lê o irmão
+      const firstLink = target.querySelector("a");
+      if (firstLink?.textContent) return firstLink.textContent.trim();
       const labEl = Array.from(target.querySelectorAll("span,div,dt")).find(
         el => el.textContent.trim().toLowerCase() === label.toLowerCase()
       );
       if (labEl?.nextElementSibling?.textContent)
         return labEl.nextElementSibling.textContent.trim();
-      // fallback: remove label do texto
       return target.textContent.replace(new RegExp("^" + label, "i"), "").trim();
     };
 
-    let brand = findLabeled("Marca").replace(/Menu da marca/gi, "").split("\n")[0].trim();
-    const size = findLabeled("Tamanho");
-    const condition = findLabeled("Estado");
-    const loadedAgo = findLabeled("Carregado");
+    let brand = findRowValue("Marca")
+      .replace(/Menu da marca/gi, "")
+      .split(/›|>/)[0]        // corta breadcrumb “› Camisolas …”
+      .split("\n")[0]
+      .trim();
 
-    // ===== FEEDBACKS (opiniões do vendedor) =====
-    // procura por algo tipo "Feedbacks (12)" / "Opiniões (3)" no texto do sidebar/body
+    const size = findRowValue("Tamanho");
+    const condition = findRowValue("Estado");
+    const loadedAgo = findRowValue("Carregado");
+
+    // ---------- FEEDBACKS ----------
     let feedbacks = null;
     const fbMatch =
       bodyText.match(/(Feedbacks|Opiniões|Avaliações)\s*\((\d+)\)/i) ||
@@ -210,29 +245,32 @@ async function scrapeItem(browser, link) {
       if (Number.isNaN(feedbacks)) feedbacks = null;
     }
 
-    // ===== FOTOS (tenta srcset + og:image) =====
+    // ---------- FOTOS ----------
     const urls = new Set();
-
-    // meta og:image
     const ogImage = getMeta("og:image");
     if (ogImage) urls.add(ogImage);
-
-    // imagens da galeria
     document.querySelectorAll("img").forEach(img => {
-      const srcset = img.getAttribute("srcset") || img.getAttribute("data-srcset");
-      if (srcset) {
-        const candidate = srcset.split(",").map(s => s.trim().split(" ")[0]).filter(Boolean).pop();
+      const ss = img.getAttribute("srcset") || img.getAttribute("data-srcset");
+      if (ss) {
+        const candidate = ss.split(",").map(s => s.trim().split(" ")[0]).filter(Boolean).pop();
         if (candidate && /^https?:\/\//i.test(candidate)) urls.add(candidate);
       }
       const src = img.getAttribute("src") || img.getAttribute("data-src");
       if (src && /^https?:\/\//i.test(src)) urls.add(src);
     });
 
+    // normalizações leves
+    const priceNorm = price ? price.replace(/\s/g, "") : "";
+    const priceTextFinal = priceText || (priceNorm
+      ? ((currency === "EUR" ? "€ " : "") + priceNorm.replace(/\./g, ","))
+      : "");
+
     return {
       title,
       url: location.href,
-      description,
-      price: price ? price.replace(/\s/g, "") : "",
+      description: "",
+      price: priceNorm,
+      priceText: priceTextFinal,
       currency,
       brand,
       size,
@@ -244,11 +282,9 @@ async function scrapeItem(browser, link) {
   });
 
   await page.close();
-
   return data;
 }
 
-// ======================= MAIN ===========================
 run().catch((err) => {
   console.error("Erro fatal:", err);
   process.exit(1);
@@ -281,13 +317,11 @@ async function run() {
       const items = await scrapeProfile(browser, profile);
       totalEncontrados += items.length;
 
-      // createdAt a partir de “Carregado há …”
       for (const it of items) {
         const dt = parseRelativePt(it.loadedAgo);
         it.createdAt = dt ? dt.toISOString() : new Date().toISOString();
       }
 
-      // filtro tempo + anti-duplicação
       const candidatos = items
         .filter(it => new Date(it.createdAt) >= cutoff)
         .filter(it => !state.posted[it.url]);
