@@ -1,14 +1,9 @@
 // ======================= IMPORTS E SETUP ===========================
-import fs from "fs";
-import path from "path";
+import fs from "fs/promises";
 import puppeteer from "puppeteer";
-import { fileURLToPath } from "url";
-import buildDiscordMessageForItem from "./discordFormat.js";
+import { buildDiscordMessageForItem } from "./discordFormat.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// fetch: Node 20 já tem fetch global, mas garantimos fallback
+// fetch: Node 20 tem fetch global; fallback para node-fetch se não houver
 const fetchHttp = (typeof fetch !== "undefined")
   ? fetch
   : (await import("node-fetch")).default;
@@ -23,194 +18,263 @@ const HOURS = parseInt(process.env.ONLY_NEWER_HOURS || "24", 10);
 const MAX_ITEMS_PER_PROFILE = parseInt(process.env.MAX_ITEMS_PER_PROFILE || "20", 10);
 const MAX_NEW_PER_PROFILE = parseInt(process.env.MAX_NEW_PER_PROFILE || "5", 10);
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
-const TEST_MODE = String(process.env.TEST_MODE || "false").toLowerCase() === "true";
+const WEBHOOK_STYLE = (process.env.WEBHOOK_STYLE || "hybrid").toLowerCase();
 
-const STATE_FILE = path.join(__dirname, "vinted_state.json");
+const STATE_PATH = "vinted_state.json";
 
-// ======================= AUX ===========================
-function log(...args) {
-  console.log(...args);
-}
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function ensureStateFile() {
-  if (!fs.existsSync(STATE_FILE)) {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ posted: {}, lastPrune: 0 }, null, 2));
-  }
-}
-function loadState() {
-  ensureStateFile();
+// ======================= ESTADO (ANTI-DUPLICAÇÃO) ===========================
+async function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const raw = await fs.readFile(STATE_PATH, "utf8");
+    const st = JSON.parse(raw);
+    if (!st.posted) st.posted = {};
+    if (!st.lastPrune) st.lastPrune = 0;
+    return st;
   } catch {
     return { posted: {}, lastPrune: 0 };
   }
 }
-function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+
+async function saveState(state) {
+  await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
-function extractItemIdFromUrl(url) {
-  // Ex.: https://www.vinted.pt/items/123456789-nome-do-artigo
-  const m = url.match(/\/items\/(\d+)/);
-  return m ? m[1] : url; // fallback: usa url inteira
+// remove marcas antigas do mapa (default 14 dias)
+function pruneState(state, days = 14) {
+  const now = Date.now();
+  if (now - (state.lastPrune || 0) < 6 * 3600 * 1000) return; // só a cada 6h
+  const cutoff = now - days * 24 * 3600 * 1000;
+  for (const [k, v] of Object.entries(state.posted)) {
+    if (!v?.ts || v.ts < cutoff) delete state.posted[k];
+  }
+  state.lastPrune = now;
+}
+
+// ======================= HELPERS ===========================
+function log(...args) {
+  console.log(...args);
+}
+
+function short(txt, max = 250) {
+  if (!txt) return "";
+  const clean = txt.replace(/\s+/g, " ").trim();
+  return clean.length > max ? clean.slice(0, max) + "..." : clean;
+}
+
+function hoursAgo(hours) {
+  return new Date(Date.now() - hours * 3600 * 1000);
+}
+
+// "há 35 minutos", "há 5 dias", "há 1 hora", "há uma hora", etc.
+function parseRelativePt(text) {
+  if (!text) return null;
+  const t = text.toLowerCase();
+
+  // valores "um/uma"
+  if (/há\s+um(a)?\s+min/.test(t)) return new Date(Date.now() - 1 * 60 * 1000);
+  if (/há\s+um(a)?\s+hora/.test(t)) return new Date(Date.now() - 1 * 3600 * 1000);
+  if (/há\s+um(a)?\s+dia/.test(t)) return new Date(Date.now() - 24 * 3600 * 1000);
+
+  let m;
+  if ((m = t.match(/há\s+(\d+)\s+min/))) {
+    const n = parseInt(m[1], 10);
+    return new Date(Date.now() - n * 60 * 1000);
+  }
+  if ((m = t.match(/há\s+(\d+)\s+hora/))) {
+    const n = parseInt(m[1], 10);
+    return new Date(Date.now() - n * 3600 * 1000);
+  }
+  if ((m = t.match(/há\s+(\d+)\s+dia/))) {
+    const n = parseInt(m[1], 10);
+    return new Date(Date.now() - n * 24 * 3600 * 1000);
+  }
+  return null;
 }
 
 async function postToDiscord(item) {
   if (!WEBHOOK) throw new Error("DISCORD_WEBHOOK_URL não configurado");
-  const payload = buildDiscordMessageForItem(item);
-  const res = await fetchHttp(WEBHOOK, {
+  const payload = WEBHOOK_STYLE === "v1"
+    ? {
+        embeds: [
+          {
+            title: item.title || "Novo artigo",
+            url: item.url,
+            description: short(item.description, 250),
+            fields: [
+              item.price ? { name: "💰 Preço", value: `${item.price} ${item.currency || ""}`.trim(), inline: true } : null,
+              item.size ? { name: "📐 Tamanho", value: item.size, inline: true } : null,
+              item.brand ? { name: "🏷️ Marca", value: item.brand, inline: true } : null,
+            ].filter(Boolean),
+            image: item.photos?.[0] ? { url: item.photos[0] } : undefined,
+            footer: { text: "Vinted Bot - Layout V1" },
+          },
+        ],
+      }
+    : buildDiscordMessageForItem(item);
+
+  await fetchHttp(WEBHOOK, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Falha no Webhook (${res.status}): ${txt.slice(0, 200)}`);
+}
+
+// ======================= PUPPETEER UTILS ===========================
+async function autoScroll(page, steps = 10, stepPx = 1200, delayMs = 300) {
+  for (let i = 0; i < steps; i++) {
+    await page.evaluate(y => window.scrollBy(0, y), stepPx);
+    await page.waitForTimeout ? page.waitForTimeout(delayMs) : new Promise(r => setTimeout(r, delayMs));
+  }
+  // volta ao topo para garantir que selectores estáveis rendem
+  await page.evaluate(() => window.scrollTo(0, 0));
+}
+
+async function ensureAtLeastOneItemLink(page, timeoutMs = 10000) {
+  try {
+    await page.waitForSelector('a[href*="/items/"]', { timeout: timeoutMs });
+  } catch {
+    // segue em frente — alguns perfis podem estar vazios
   }
 }
 
 // ======================= SCRAPER ===========================
-async function scrapeProfile(browser, profileUrl) {
+async function scrapeProfile(browser, url) {
   const page = await browser.newPage();
-  await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  // Aguarda o body e algum carregamento
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForSelector("body", { timeout: 30000 }).catch(() => null);
 
-  // Captura links para /items/
-  const itemLinks = await page.$$eval("a[href*='/items/']", (links) =>
+  // força o carregamento de mais cards
+  await autoScroll(page, 12, 1400, 200);
+  await ensureAtLeastOneItemLink(page);
+
+  // recolhe links dos artigos
+  const rawLinks = await page.$$eval('a[href*="/items/"]', (links) =>
     links.map((a) => a.href)
-  ).catch(() => []);
+  );
+  const uniqueItems = [...new Set(rawLinks)].slice(0, MAX_ITEMS_PER_PROFILE);
 
-  const uniqueLinks = [...new Set(itemLinks)].slice(0, MAX_ITEMS_PER_PROFILE);
-  await page.close();
-
-  const results = [];
-  for (const link of uniqueLinks) {
+  const scraped = [];
+  for (const link of uniqueItems) {
     try {
-      const itemPage = await browser.newPage();
-      await itemPage.goto(link, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-      // Tentamos extrair dados estruturados e do DOM
-      const data = await itemPage.evaluate(() => {
-        const getText = (sel) => document.querySelector(sel)?.textContent?.trim() || "";
-
-        // Título
-        let title = document.querySelector("h1")?.textContent?.trim()
-          || document.title.replace(/\s*\|\s*Vinted.*$/i, "").trim();
-
-        // Preço (tentativas por data-testid, atributos e fallback)
-        let price = "";
-        const priceNode =
-          document.querySelector("[data-testid='item-price']") ||
-          document.querySelector("data[item-price]") ||
-          document.querySelector("meta[itemprop='price']") ||
-          document.querySelector("span[class*='price']");
-
-        if (priceNode) {
-          price = (priceNode.getAttribute?.("content") || priceNode.textContent || "").trim();
-        }
-
-        // Tamanho / Marca / Estado (depende do layout da Vinted; fazemos tentativas genéricas)
-        let size = "";
-        let brand = "";
-        let condition = "";
-
-        // Tenta apanhar pares label: value
-        document.querySelectorAll("div, li").forEach((el) => {
-          const t = el.textContent?.toLowerCase() || "";
-          if (!size && /tamanho|tam/i.test(t)) size = el.textContent.trim();
-          if (!brand && /marca/i.test(t)) brand = el.textContent.trim();
-          if (!condition && /(estado|condiç)/i.test(t)) condition = el.textContent.trim();
-        });
-
-        // Fotos (prioriza imagens grandes / CDN)
-        const imgs = Array.from(document.querySelectorAll("img"))
-          .map((i) => i.src || i.getAttribute("data-src") || "")
-          .filter((src) => src && /^https?:\/\//i.test(src));
-        // Ordena por "maior" (heurística: as de thumbnails às vezes terminam com tamanhos pequenos)
-        const uniqueImgs = Array.from(new Set(imgs));
-
-        // Feedbacks do vendedor (quando visível no perfil do item)
-        let sellerFeedbackCount = null;
-        const feedbackCandidate = Array.from(document.querySelectorAll("a, span, div"))
-          .map((el) => el.textContent?.trim() || "")
-          .find((t) => /\b(opini(ões|ao)|feedback|avalia(ç|c)ões?)\b/i.test(t) && /\d+/.test(t));
-        if (feedbackCandidate) {
-          const n = feedbackCandidate.match(/\d+/);
-          if (n) sellerFeedbackCount = parseInt(n[0], 10);
-        }
-
-        return {
-          title: title || "Artigo Vinted",
-          url: location.href,
-          price: price || "",
-          currency: "EUR",
-          size,
-          brand,
-          condition,
-          photos: uniqueImgs.slice(0, 3),
-          sellerFeedbackCount: Number.isFinite(sellerFeedbackCount)
-            ? sellerFeedbackCount
-            : undefined,
-        };
-      });
-
-      await itemPage.close();
-      results.push({ ...data, id: extractItemIdFromUrl(link) });
-      // Pequena pausa entre itens
-      await new Promise((r) => setTimeout(r, 500));
+      const it = await scrapeItem(browser, link);
+      if (it) scraped.push(it);
     } catch (e) {
-      log("Erro ao extrair item:", e.message);
+      log("  • Erro a extrair item:", e.message);
     }
   }
 
-  return results;
+  await page.close();
+  return scraped;
 }
 
-// ======================= TESTE MANUAL (TEST_MODE) ===================
-async function runTestOnce() {
-  const demo = {
-    id: "demo-123",
-    title: "👗 Vestido comprido floral ZARA",
-    url: "https://www.vinted.pt/items/123456789-vestido-zara-floral",
-    price: "19.99",
-    currency: "EUR",
-    size: "M",
-    brand: "Zara",
-    condition: "Como novo",
-    sellerFeedbackCount: 128,
-    photos: [
-      "https://images.vinted.net/thumbs/f800x800/01_demo_img1.jpg",
-      "https://images.vinted.net/thumbs/f800x800/01_demo_img2.jpg",
-      "https://images.vinted.net/thumbs/f800x800/01_demo_img3.jpg",
-    ],
-  };
-  log("🧪 TESTE: a publicar item de demonstração no Discord...");
-  await postToDiscord(demo);
-  log("✅ Teste enviado!");
+async function scrapeItem(browser, link) {
+  const page = await browser.newPage();
+  await page.goto(link, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForSelector("body", { timeout: 30000 }).catch(() => null);
+
+  // dá um pequeno scroll para forçar imagens e painel
+  await autoScroll(page, 2, 800, 150);
+
+  const data = await page.evaluate(() => {
+    const selText = (sel) => document.querySelector(sel)?.textContent?.trim() || "";
+
+    // título/descrição
+    const title = selText("h1") || document.title || "";
+    // descrição típica dentro do painel da direita (parágrafo principal)
+    let description = "";
+    const rightPanel = document.querySelector('[data-testid="sidebar"]') || document.querySelector("aside") || document;
+    // tenta um parágrafo maior
+    const descCand = rightPanel.querySelector("p, div[data-testid='item-description']");
+    if (descCand) description = descCand.textContent.trim();
+
+    // preço
+    let price = "";
+    let currency = "";
+    const priceNode = document.querySelector("[data-testid='item-price'], [data-testid='price'], [class*='price'] span");
+    if (priceNode) {
+      const tx = priceNode.textContent.trim();
+      // ex: "€ 40,00" ou "40,00 €"
+      const m = tx.match(/([\d.,]+)\s*([A-Z€]+)/i) || tx.match(/([€])\s*([\d.,]+)/i);
+      if (m) {
+        if (m[2] && m[1].includes(",")) { // "€ 40,00"
+          price = m[2] ? m[2] : m[1];
+          currency = m[2] ? m[1] : "EUR";
+        } else if (m[1] && m[2]) { // "40,00 €"
+          price = m[1]; currency = m[2];
+        } else {
+          price = tx;
+        }
+      } else {
+        price = tx;
+      }
+    }
+
+    // fotos (unicas, https)
+    const imgs = Array.from(document.querySelectorAll("img"))
+      .map(i => i.getAttribute("src") || i.getAttribute("data-src") || "")
+      .filter(u => u && /^https?:\/\//i.test(u));
+
+    // leitura de campos rotulados (Marca, Tamanho, Estado, Carregado)
+    const grabField = (label) => {
+      // procura um span ou div cujo texto seja exatamente o label
+      const candidates = Array.from(document.querySelectorAll("span,div,dt")).filter(
+        el => el.textContent.trim() === label
+      );
+      for (const labEl of candidates) {
+        // valor normalmente está no irmão seguinte
+        const vEl = labEl.nextElementSibling;
+        if (vEl && vEl.textContent) return vEl.textContent.trim();
+        // fallback: remove o label do texto do pai
+        const parent = labEl.parentElement;
+        if (parent) {
+          const t = parent.textContent.replace(label, "").trim();
+          if (t) return t;
+        }
+      }
+      // fallback por contains
+      const any = Array.from(document.querySelectorAll("div,li")).find(el =>
+        el.textContent.trim().startsWith(label + " ")
+      );
+      if (any) return any.textContent.replace(label, "").trim();
+      return "";
+    };
+
+    const brand = grabField("Marca");
+    const size = grabField("Tamanho");
+    const condition = grabField("Estado");
+    const loadedAgo = grabField("Carregado"); // e.g. "há 35 minutos"
+
+    return {
+      title,
+      url: location.href,
+      description,
+      price,
+      currency,
+      brand,
+      size,
+      condition,
+      loadedAgo,           // texto relativo
+      photos: Array.from(new Set(imgs)).slice(0, 6),
+    };
+  });
+
+  await page.close();
+  return data;
 }
 
-// ======================= EXECUÇÃO NORMAL ===========================
+// ======================= MAIN ===========================
+run().catch(async (err) => {
+  console.error("Erro fatal:", err);
+  process.exit(1);
+});
+
 async function run() {
-  if (TEST_MODE) {
-    await runTestOnce();
-    return;
-  }
-
   if (!PROFILES.length) {
-    console.error("Nenhum perfil configurado em VINTED_PROFILE_URLS!");
+    console.error("Nenhum perfil configurado!");
     return;
   }
-  if (!WEBHOOK) {
-    console.error("DISCORD_WEBHOOK_URL não configurado!");
-    return;
-  }
-
-  const state = loadState();
-  let totalEncontrados = 0;
-  let totalPublicados = 0;
+  const state = await loadState();
+  pruneState(state);
 
   log(`🔎 A verificar ${PROFILES.length} perfis (últimas ${HOURS}h) ...`);
 
@@ -219,24 +283,46 @@ async function run() {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
+  const cutoff = hoursAgo(HOURS);
+  let totalEncontrados = 0;
+  let totalPublicados = 0;
+
   for (const profile of PROFILES) {
     log(`→ Perfil: ${profile}`);
+
     try {
       const items = await scrapeProfile(browser, profile);
       totalEncontrados += items.length;
 
-      // Filtra apenas os ainda não publicados
-      const novos = items.filter((it) => !state.posted[it.id]).slice(0, MAX_NEW_PER_PROFILE);
+      // normaliza createdAt a partir de "Carregado há ..."
+      for (const it of items) {
+        const dt = parseRelativePt(it.loadedAgo);
+        it.createdAt = dt ? dt.toISOString() : new Date().toISOString();
+      }
 
-      for (const item of novos) {
-        try {
-          await postToDiscord(item);
-          state.posted[item.id] = Date.now();
-          totalPublicados++;
-          await sleep(1000); // curto delay para não spammar o Discord
-        } catch (e) {
-          log("Falha ao publicar no Discord:", e.message);
-        }
+      // filtra por tempo e anti-duplicação (por URL)
+      const candidatos = items
+        .filter(it => new Date(it.createdAt) >= cutoff)
+        .filter(it => !state.posted[it.url]);
+
+      // limita por perfil
+      const toPost = candidatos.slice(0, MAX_NEW_PER_PROFILE);
+
+      for (const item of toPost) {
+        await postToDiscord({
+          ...item,
+          // trims finais
+          description: short(item.description, 280),
+          photos: (item.photos || []).slice(0, 3), // 1 principal + 2 extra
+        });
+        totalPublicados++;
+
+        // marca como publicado imediatamente (reduz risco de duplicação entre runs paralelas)
+        state.posted[item.url] = { ts: Date.now() };
+        await saveState(state);
+
+        // rate limit de segurança
+        await new Promise(r => setTimeout(r, 1200));
       }
     } catch (err) {
       log("Erro geral:", err.message);
@@ -244,23 +330,6 @@ async function run() {
   }
 
   await browser.close();
-
-  // Pequena manutenção: limpa IDs antigos do mapa (ex: mais de 30 dias)
-  const THIRTY_DAYS = 30 * 24 * 3600 * 1000;
-  const now = Date.now();
-  if (!state.lastPrune || now - state.lastPrune > 24 * 3600 * 1000) {
-    for (const [id, ts] of Object.entries(state.posted)) {
-      if (now - ts > THIRTY_DAYS) delete state.posted[id];
-    }
-    state.lastPrune = now;
-  }
-
-  saveState(state);
+  await saveState(state);
   log(`📦 Resumo: encontrados=${totalEncontrados}, publicados=${totalPublicados}`);
 }
-
-// ======================= START ===========================
-run().catch((err) => {
-  console.error("Erro fatal:", err);
-  process.exit(1);
-});
