@@ -131,26 +131,33 @@ async function scrapeItem(browser, link) {
     // Título
     const title = textOf("h1") || document.title || "";
 
-    // Descrição (não vamos mostrar, mas fica para backup/filtros)
+    // Descrição (backup)
     let description = "";
     const descNode = sidebar.querySelector("p, div[data-testid='item-description']");
     if (descNode) description = descNode.textContent.trim();
 
-    // Preço — extrai do texto do painel
-    let price = "", currency = "";
-    const sidebarText = (sidebar.innerText || "").replace(/\s+/g, " ");
-    // tenta € 51,00 / 51,00 € / 51 EUR
-    const m = sidebarText.match(/([€£$]\s*\d[\d.,]*)|(\d[\d.,]*\s*(€|EUR|GBP|USD))/i);
+    // Painel de texto inteiro para regex
+    const sidebarText = (sidebar.innerText || "")
+      .replace(/\s+/g, " ")
+      .replace(/[,](\d{3})\b/g, ".$1"); // normaliza “1,000” -> “1.000” (por segurança)
+
+    // ===== PREÇO ROBUSTO =====
+    let price = "";
+    let currency = "";
+
+    // 1) € 51,00   |  £ 20.00  |  $ 15.50
+    let m = sidebarText.match(/[€£$]\s*\d[\d.,]*/);
     if (m) {
-      const tx = m[0];
-      // normalização simples
-      if (/^[€£$]/.test(tx)) { // "€ 40,00"
-        currency = tx[0];
-        price = tx.replace(/[€£$]\s*/,"").trim();
-      } else { // "40,00 €" ou "40 EUR"
-        const parts = tx.split(/\s+/);
+      currency = m[0][0] === "€" ? "EUR" : (m[0][0] === "£" ? "GBP" : "USD");
+      price = m[0].replace(/[€£$\s]/g, "").trim();
+    } else {
+      // 2) 51,00 €   |  51 EUR
+      m = sidebarText.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
+      if (m) {
+        const parts = m[0].trim().split(/\s+/);
         price = parts[0];
-        currency = parts[1] || "";
+        const cur = parts[1].toUpperCase();
+        currency = cur === "€" ? "EUR" : cur;
       }
     }
 
@@ -161,7 +168,6 @@ async function scrapeItem(browser, link) {
 
     // Campo utilitário para pares "Label -> Valor"
     const getLabeledValue = (label) => {
-      // encontra bloco da linha
       const row = Array.from(sidebar.querySelectorAll("div,li,dt,section")).find(el =>
         el.textContent.trim().toLowerCase().startsWith(label.toLowerCase())
       );
@@ -171,7 +177,7 @@ async function scrapeItem(browser, link) {
       const a = row.querySelector("a");
       if (a && a.textContent) return a.textContent.trim();
 
-      // senão, pega irmão seguinte do label
+      // senão, encontra o nó do label e lê o irmão
       const labEl = Array.from(row.querySelectorAll("span,div,dt")).find(
         el => el.textContent.trim().toLowerCase() === label.toLowerCase()
       );
@@ -179,7 +185,7 @@ async function scrapeItem(browser, link) {
         return labEl.nextElementSibling.textContent.trim();
       }
 
-      // fallback: remove o label do texto da linha
+      // fallback: remove o label do texto
       return row.textContent.replace(new RegExp("^" + label, "i"), "").trim();
     };
 
@@ -206,6 +212,12 @@ async function scrapeItem(browser, link) {
   });
 
   await page.close();
+
+  // Normalização extra do preço (substitui vírgula por ponto só para consistência; mantém original para visual)
+  if (data && data.price) {
+    data.price = data.price.replace(/\s/g, "");
+  }
+
   return data;
 }
 
@@ -242,13 +254,13 @@ async function run() {
       const items = await scrapeProfile(browser, profile);
       totalEncontrados += items.length;
 
-      // normaliza createdAt a partir de “Carregado há …”
+      // createdAt a partir de “Carregado há …”
       for (const it of items) {
         const dt = parseRelativePt(it.loadedAgo);
         it.createdAt = dt ? dt.toISOString() : new Date().toISOString();
       }
 
-      // filtro por tempo + anti-duplicação
+      // filtro tempo + anti-duplicação
       const candidatos = items
         .filter(it => new Date(it.createdAt) >= cutoff)
         .filter(it => !state.posted[it.url]);
@@ -259,7 +271,7 @@ async function run() {
         await postToDiscord({
           ...item,
           description: short(item.description, 280),
-          photos: (item.photos || []).slice(0, 4), // 1 (image) + 1 (thumb) + 2 extras
+          photos: (item.photos || []).slice(0, 3), // 1 thumb no principal + 2 thumbs extra
         });
 
         // marca como publicado
@@ -267,7 +279,7 @@ async function run() {
         await saveState(state);
 
         totalPublicados++;
-        await new Promise(r => setTimeout(r, 1200));
+        await new Promise(r => setTimeout(r, 1000));
       }
     } catch (err) {
       log("Erro geral:", err.message);
