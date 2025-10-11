@@ -17,7 +17,7 @@ const MAX_ITEMS_PER_PROFILE = parseInt(process.env.MAX_ITEMS_PER_PROFILE || "20"
 const MAX_NEW_PER_PROFILE = parseInt(process.env.MAX_NEW_PER_PROFILE || "3", 10);
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 
-// ======================= FUNÇÕES DE SUPORTE ===========================
+// ======================= FUNÇÕES AUXILIARES ===========================
 function log(...args) {
   console.log(...args);
 }
@@ -28,40 +28,11 @@ function short(txt, max = 120) {
   return clean.length > max ? clean.slice(0, max) + "..." : clean;
 }
 
-function hoursAgo(hours) {
-  return new Date(Date.now() - hours * 3600 * 1000);
-}
-
-// ======================= DISCORD PAYLOADS ===========================
-
-// ---- Layout antigo (PerfeitoV1) ----
-function buildLegacyPayload(item) {
-  return {
-    embeds: [
-      {
-        title: item.title || "Novo artigo",
-        url: item.url,
-        description: short(item.description, 250),
-        fields: [
-          item.price ? { name: "💰 Preço", value: `${item.price} ${item.currency || "€"}`, inline: true } : null,
-          item.size ? { name: "📐 Tamanho", value: item.size, inline: true } : null,
-          item.brand ? { name: "🏷️ Marca", value: item.brand, inline: true } : null,
-        ].filter(Boolean),
-        image: item.photos?.[0] ? { url: item.photos[0] } : undefined,
-        footer: { text: "Vinted Bot - Layout V1" },
-      },
-    ],
-  };
-}
-
-// ---- Novo layout híbrido ----
+// ======================= DISCORD POST ===========================
 async function postToDiscord(item) {
   if (!WEBHOOK) throw new Error("DISCORD_WEBHOOK_URL não configurado");
 
-  const style = (process.env.WEBHOOK_STYLE || "hybrid").toLowerCase();
-  const payload = style === "v1"
-    ? buildLegacyPayload(item)
-    : buildDiscordMessageForItem(item);
+  const payload = buildDiscordMessageForItem(item);
 
   await fetchHttp(WEBHOOK, {
     method: "POST",
@@ -81,8 +52,8 @@ async function scrapeProfile(browser, url) {
   );
 
   const uniqueItems = [...new Set(items)].slice(0, MAX_ITEMS_PER_PROFILE);
-
   const scraped = [];
+
   for (const link of uniqueItems) {
     try {
       const itemPage = await browser.newPage();
@@ -96,11 +67,19 @@ async function scrapeProfile(browser, url) {
         const imgs = Array.from(document.querySelectorAll("img"))
           .map((i) => i.src)
           .filter((src) => src.includes("https"));
+
+        const brand = get("dt:contains('Marca') + dd") || "";
+        const size = get("dt:contains('Tamanho') + dd") || "";
+        const condition = get("dt:contains('Estado') + dd") || "";
+
         return {
           title,
           url: window.location.href,
           description,
           price,
+          brand,
+          size,
+          condition,
           photos: imgs.slice(0, 4),
         };
       });
@@ -154,40 +133,8 @@ async function run() {
   log(`📦 Resumo: encontrados=${totalEncontrados}, publicados=${totalPublicados}`);
 }
 
-// ======================= TESTE MANUAL FORÇADO ===========================
-(async () => {
-  const TEST_MODE = true; // força sempre o modo de teste
-
-  if (TEST_MODE) {
-    const itemTeste = {
-      title: "Camisola Branca Mulher Ralph Lauren Tamanho XL",
-      url: "https://www.vinted.pt/items/123456789-camisola-ralph-lauren-xl",
-      description:
-        "Camisola Polo Ralph Lauren em malha branca, padrão entrançado e logo bordado azul-marinho no peito. Tecido de alta qualidade — ideal para um look casual elegante.",
-      price: "40.00",
-      currency: "EUR",
-      size: "XL / 42 / 14",
-      brand: "Ralph Lauren",
-      condition: "Muito bom",
-      photos: [
-        "https://images.vinted.net/thumbs/f800x800/01_0021b_Vinted_Item1.jpg",
-        "https://images.vinted.net/thumbs/f800x800/02_0021b_Vinted_Item2.jpg",
-        "https://images.vinted.net/thumbs/f800x800/03_0021b_Vinted_Item3.jpg",
-      ],
-      sellerName: "medp1",
-      sellerUrl: "https://www.vinted.pt/member/medp1",
-      sellerAvatar: "https://cdn-icons-png.flaticon.com/512/194/194938.png",
-      createdAt: new Date().toISOString(),
-    };
-
-    console.log("🧪 TESTE FORÇADO: a publicar item de demonstração no Discord...");
-    await postToDiscord(itemTeste);
-    console.log("✅ Teste enviado para o Discord com sucesso!");
-    process.exit(0);
-  } else {
-    await run().catch((err) => {
-      console.error("Erro fatal:", err);
-      process.exit(1);
-    });
-  }
-})();
+// ======================= EXECUÇÃO ===========================
+run().catch((err) => {
+  console.error("Erro fatal:", err);
+  process.exit(1);
+});
