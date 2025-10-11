@@ -2,8 +2,8 @@ name: Vinted → Discord (Node + Puppeteer)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"     # corre a cada 30 minutos (UTC)
-  workflow_dispatch:            # permite correr manualmente
+    - cron: "*/30 * * * *"   # a cada 30 minutos (UTC)
+  workflow_dispatch:
 
 jobs:
   run:
@@ -19,19 +19,41 @@ jobs:
         with:
           node-version: "20"
 
+      # ↓↓↓ PERSISTÊNCIA DO ESTADO: baixa o artifact (se existir)
+      - name: Download state artifact (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: vinted-state
+          path: .
+        continue-on-error: true
+
+      # Se o estado não existir ainda, cria vazio
+      - name: Ensure empty state file exists
+        run: |
+          if [ ! -f "vinted_state.json" ]; then
+            echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
+          fi
+          echo "State file:"
+          cat vinted_state.json
+
       - name: Install deps
         run: npm ci || npm i
 
-      - name: Run bot
+      - name: Run
         env:
-          # ---- obrigatórios ----
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-
-          # ---- do repositório (Settings → Variables) ----
-          VINTED_PROFILE_URLS:   ${{ vars.VINTED_PROFILE_URLS }}
-          ONLY_NEWER_HOURS:      ${{ vars.ONLY_NEWER_HOURS }}
-          MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE }}
-          MAX_NEW_PER_PROFILE:   ${{ vars.MAX_NEW_PER_PROFILE }}
-          TEST_MODE:             ${{ vars.TEST_MODE }}   # "true" para enviar o card de teste
-          WEBHOOK_STYLE:         ${{ vars.WEBHOOK_STYLE }} # opcional: "hybrid" (default) ou "v1"
+          VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS || secrets.VINTED_PROFILE_URLS }}
+          ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || '24' }}
+          MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || '10' }}
+          MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || '5' }}
+          TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
         run: node index.js
+
+      # ↑↑↑ PERSISTÊNCIA DO ESTADO: sobe o artifact atualizado
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vinted-state
+          path: vinted_state.json
+          retention-days: 60
