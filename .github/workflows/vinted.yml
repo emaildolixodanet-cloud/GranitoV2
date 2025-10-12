@@ -2,7 +2,7 @@ name: Vinted → Discord (Node + Puppeteer)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"    # a cada 30 minutos (UTC)
+    - cron: "*/30 * * * *"   # a cada 30 minutos (UTC)
   workflow_dispatch:
 
 jobs:
@@ -19,12 +19,12 @@ jobs:
         with:
           node-version: "20"
 
-      # Baixar o artifact mais recente (se existir) via GitHub CLI
-      - name: Download latest state artifact (if exists)
-        shell: bash
+      # ↓↓↓ PERSISTÊNCIA DO ESTADO: baixar o último artifact (se existir)
+      - name: Download latest state (artifact)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+        shell: bash
         run: |
           set -e
           if ! command -v gh >/dev/null 2>&1; then
@@ -41,6 +41,9 @@ jobs:
           else
             echo "Sem artefactos anteriores."
           fi
+
+      - name: Ensure empty state file exists
+        run: |
           if [ ! -f "vinted_state.json" ]; then
             echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
           fi
@@ -56,15 +59,11 @@ jobs:
           VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS || secrets.VINTED_PROFILE_URLS }}
           ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || '24' }}
           MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || '10' }}
-          # Aumenta se quiseres “varrer” mais por run; vazio/0 = sem limite
           MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || '5' }}
           TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
-          # Opcional: republicar após X horas (0 = nunca)
-          POSTED_TTL_HOURS: ${{ vars.POSTED_TTL_HOURS || '0' }}
-          # Para diagnóstico de skips (liga sozinho quando TEST_MODE=true)
-          DEBUG_SKIPS: ${{ vars.DEBUG_SKIPS || '' }}
         run: node index.js
 
+      # ↑↑↑ PERSISTÊNCIA DO ESTADO: subir o artifact atualizado
       - name: Upload state artifact
         if: always()
         uses: actions/upload-artifact@v4
