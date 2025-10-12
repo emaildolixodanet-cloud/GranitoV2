@@ -24,10 +24,9 @@ async function saveState(state) {
 }
 
 function normalizeKey(url) {
-  // extrai o ID numérico do item da URL, ex: .../items/7194468874-...
   const m = String(url).match(/\/items\/(\d+)/);
   if (m) return `item:${m[1]}`;
-  return url; // fallback
+  return url;
 }
 
 // ───────────── Scraper ─────────────
@@ -39,21 +38,35 @@ async function scrapeProfile(browser, profileUrl, onlyNewerHours, maxItems) {
     ? `${profileUrl}&order=newest_first`
     : `${profileUrl}?order=newest_first`;
 
-  await page.goto(url, { waitUntil: "networkidle2" });
+  await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // tenta apanhar cartões (selectors variam no Vinted)
-  await page.waitForTimeout(2000); // pequeno delay para render
+  // Esperar por links de items; se não renderizar, pequeno fallback
+  const itemSelector = 'a[href*="/items/"]';
+  try {
+    await page.waitForSelector(itemSelector, { timeout: 15000 });
+  } catch {
+    // fallback curtinho (2s) sem usar page.waitForTimeout
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  // Se disponível na tua versão do Puppeteer, isto ajuda:
+  if (typeof page.waitForNetworkIdle === "function") {
+    try {
+      await page.waitForNetworkIdle({ idleTime: 1000, timeout: 15000 });
+    } catch {
+      /* ignora */
+    }
+  }
+
   const items = await page.evaluate(() => {
     const anchors = [
       ...document.querySelectorAll('a[href*="/items/"]')
     ].filter((a) => /\/items\/\d+/.test(a.getAttribute("href") || ""));
 
-    // deduplicar por href absoluto
     const map = new Map();
     for (const a of anchors) {
       const href = a.href;
       if (!map.has(href)) {
-        // tenta apanhar info útil ao redor
         const root = a.closest("div") || a;
         const title =
           root.querySelector('[data-testid*="title"], [class*="title"], [title]')?.textContent?.trim() ||
@@ -74,23 +87,17 @@ async function scrapeProfile(browser, profileUrl, onlyNewerHours, maxItems) {
 
   await page.close();
 
-  // limitar itens iniciais
   const limited = items.slice(0, maxItems);
-
-  // Filtro temporal (aproximação: assumimos listagem por ordem e usamos hora atual)
-  // Como o Vinted não expõe sempre timestamps, usamos a janela de "novidades" via execução frequente.
-  // O controlo real de duplicados fica no estado (não repete nada que já foi postado).
   const now = Date.now();
-  const cutoff = now - Number(onlyNewerHours) * 3600 * 1000;
 
-  return limited.map((i) => ({ ...i, discoveredAt: now, cutoff }));
+  return limited.map((i) => ({ ...i, discoveredAt: now }));
 }
 
 // ───────────── Discord ─────────────
 async function postToDiscord(webhookUrl, batch) {
   if (!Array.isArray(batch) || batch.length === 0) return;
 
-  // Discord limita 10 embeds por mensagem → partimos em blocos de 10
+  // 10 embeds por pedido
   const chunks = [];
   for (let i = 0; i < batch.length; i += 10) {
     chunks.push(batch.slice(i, i + 10));
@@ -112,7 +119,6 @@ async function postToDiscord(webhookUrl, batch) {
     });
 
     const payload = {
-      // IMPORTANTE: garantir sempre content (mesmo com embeds)
       content: `🧱 **Novidades no Vinted** (${chunk.length} item${chunk.length > 1 ? "s" : ""})`,
       embeds: embeds.length ? embeds : undefined
     };
@@ -188,13 +194,12 @@ async function postToDiscord(webhookUrl, batch) {
         continue;
       }
 
-      // filtrar por não publicados + respeitar janela temporal via estado
+      // filtrar por não publicados + janela temporal (aproximação)
       const fresh = [];
       for (const it of items) {
         const key = normalizeKey(it.url);
-        if (state.posted[key]) continue; // já publicado
+        if (state.posted[key]) continue;
 
-        // janela de "novidade" aproximada (se necessário no futuro, pode-se ler o "listed X ago")
         const withinWindow = it.discoveredAt >= (now - ONLY_NEWER_HOURS * 3600 * 1000);
         if (!withinWindow) continue;
 
@@ -208,7 +213,7 @@ async function postToDiscord(webhookUrl, batch) {
     await browser.close().catch(() => {});
   }
 
-  console.log(`📦 Resumo: encontrados=${toPublish.length ? toPublish.length : 0}, a_publicar=${toPublish.length}`);
+  console.log(`📦 Resumo: encontrados=${toPublish.length || 0}, a_publicar=${toPublish.length}`);
 
   if (!toPublish.length) {
     await saveState(state);
@@ -220,13 +225,11 @@ async function postToDiscord(webhookUrl, batch) {
       await postToDiscord(DISCORD_WEBHOOK_URL, toPublish);
     } catch (err) {
       console.error(`❌ Erro ao publicar no Discord: ${err.message}`);
-      // mesmo com erro, marcamos o que tentámos para evitar spam se o payload foi parcialmente aceite
     }
   } else {
     console.log("🧪 TEST_MODE=on → não envio para Discord.");
   }
 
-  // marcar como publicados
   for (const it of toPublish) {
     const key = normalizeKey(it.url);
     state.posted[key] = { ts: now, url: it.url };
