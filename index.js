@@ -15,6 +15,22 @@ const MAX_NEW_PER_PROFILE = parseInt(process.env.MAX_NEW_PER_PROFILE || "5", 10)
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const STATE_PATH = "vinted_state.json";
 
+const log = (...a) => console.log(...a);
+
+/* ======== DEDUPE ROBUSTO POR ID ======== */
+function extractItemId(u) {
+  try {
+    const url = new URL(u);
+    const m = url.pathname.match(/\/items\/(\d+)/);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+function canonicalKey(u) {
+  const id = extractItemId(u);
+  return id ? `item:${id}` : (new URL(u)).origin + (new URL(u)).pathname; // fallback
+}
+/* ======================================= */
+
 async function loadState() {
   try {
     const raw = await fs.readFile(STATE_PATH, "utf8");
@@ -37,7 +53,6 @@ function pruneState(state, days = 14) {
   state.lastPrune = now;
 }
 
-const log = (...a) => console.log(...a);
 const short = (t, m = 250) => {
   if (!t) return "";
   const c = t.replace(/\s+/g, " ").trim();
@@ -84,14 +99,21 @@ async function scrapeProfile(browser, url) {
   const page = await browser.newPage();
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForSelector("body", { timeout: 30000 }).catch(() => null);
-
   await autoScroll(page, 12, 1400, 200);
   await ensureAtLeastOneItemLink(page);
 
   const rawLinks = await page.$$eval('a[href*="/items/"]', (links) =>
     links.map((a) => a.href)
   );
-  const links = [...new Set(rawLinks)].slice(0, MAX_ITEMS_PER_PROFILE);
+
+  // normalizar: remover dupes por ID
+  const byId = new Map();
+  for (const href of rawLinks) {
+    const id = extractItemId(href);
+    if (!id) continue;
+    if (!byId.has(id)) byId.set(id, href);
+  }
+  const links = Array.from(byId.values()).slice(0, MAX_ITEMS_PER_PROFILE);
 
   const out = [];
   for (const link of links) {
@@ -124,12 +146,9 @@ async function scrapeItem(browser, link) {
     const textOf = (sel, root = document) => root.querySelector(sel)?.textContent?.trim() || "";
     const title = textOf("h1") || document.title || "";
 
-    // ---------- PREÇO: várias estratégias ----------
-    let price = "";         // numérico (string)
-    let priceText = "";     // como aparece na UI (mantém vírgula/símbolo)
-    let currency = "";
+    // --- PREÇO muito robusto (JSON-LD → scripts → meta → UI) ---
+    let price = "", priceText = "", currency = "";
 
-    // (A) JSON-LD
     try {
       const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
         .map(s => s.textContent)
@@ -153,7 +172,6 @@ async function scrapeItem(browser, link) {
       }
     } catch {}
 
-    // (B) Next.js data / scripts com "price"
     if (!price) {
       const scripts = Array.from(document.querySelectorAll("script"))
         .map(s => s.textContent || "")
@@ -169,7 +187,6 @@ async function scrapeItem(browser, link) {
       }
     }
 
-    // (C) Meta tags
     if (!price) {
       const metaAmount = getMeta("product:price:amount") || getMeta("og:price:amount");
       const metaCurrency = getMeta("product:price:currency") || getMeta("og:price:currency");
@@ -179,14 +196,11 @@ async function scrapeItem(browser, link) {
       }
     }
 
-    // (D) Selectores visíveis (botões/etiquetas)
     if (!price) {
       const sideTxt = (sidebar.innerText || "").replace(/\s+/g, " ");
-      // € 19,99  |  19,99 €  |  19,99 EUR
       let m = sideTxt.match(/[€£$]\s*\d[\d.,]*/) ||
               sideTxt.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
       if (!m) {
-        // tenta no botão de comprar
         const btnTxt = Array.from(document.querySelectorAll("button, a"))
           .map(el => el.textContent?.replace(/\s+/g, " ").trim() || "")
           .filter(Boolean)
@@ -209,7 +223,6 @@ async function scrapeItem(browser, link) {
       }
     }
 
-    // ---------- MARCA / TAMANHO / ESTADO / CARREGADO ----------
     const findRowValue = (label) => {
       const root = sidebar;
       const rows = Array.from(root.querySelectorAll("div,li,dt,section"));
@@ -227,7 +240,7 @@ async function scrapeItem(browser, link) {
 
     let brand = findRowValue("Marca")
       .replace(/Menu da marca/gi, "")
-      .split(/›|>/)[0]        // corta breadcrumb “› Camisolas …”
+      .split(/›|>/)[0]
       .split("\n")[0]
       .trim();
 
@@ -235,7 +248,6 @@ async function scrapeItem(browser, link) {
     const condition = findRowValue("Estado");
     const loadedAgo = findRowValue("Carregado");
 
-    // ---------- FEEDBACKS ----------
     let feedbacks = null;
     const fbMatch =
       bodyText.match(/(Feedbacks|Opiniões|Avaliações)\s*\((\d+)\)/i) ||
@@ -245,7 +257,6 @@ async function scrapeItem(browser, link) {
       if (Number.isNaN(feedbacks)) feedbacks = null;
     }
 
-    // ---------- FOTOS ----------
     const urls = new Set();
     const ogImage = getMeta("og:image");
     if (ogImage) urls.add(ogImage);
@@ -259,11 +270,10 @@ async function scrapeItem(browser, link) {
       if (src && /^https?:\/\//i.test(src)) urls.add(src);
     });
 
-    // normalizações leves
     const priceNorm = price ? price.replace(/\s/g, "") : "";
-    const priceTextFinal = priceText || (priceNorm
+    const priceTextFinal = (priceText || (priceNorm
       ? ((currency === "EUR" ? "€ " : "") + priceNorm.replace(/\./g, ","))
-      : "");
+      : "")).trim();
 
     return {
       title,
@@ -298,8 +308,8 @@ async function run() {
 
   const state = await loadState();
   pruneState(state);
-  const cutoff = hoursAgo(HOURS);
 
+  const cutoff = hoursAgo(HOURS);
   log(`🔎 A verificar ${PROFILES.length} perfis (últimas ${HOURS}h) ...`);
 
   const browser = await puppeteer.launch({
@@ -320,11 +330,14 @@ async function run() {
       for (const it of items) {
         const dt = parseRelativePt(it.loadedAgo);
         it.createdAt = dt ? dt.toISOString() : new Date().toISOString();
+
+        // chave canónica por ID
+        it.key = canonicalKey(it.url);
       }
 
       const candidatos = items
         .filter(it => new Date(it.createdAt) >= cutoff)
-        .filter(it => !state.posted[it.url]);
+        .filter(it => it.key && !state.posted[it.key]);  // DEDUPE
 
       const toPost = candidatos.slice(0, MAX_NEW_PER_PROFILE);
 
@@ -332,10 +345,10 @@ async function run() {
         await postToDiscord({
           ...item,
           description: short(item.description, 280),
-          photos: (item.photos || []).slice(0, 3), // 1 + 2 thumbs
+          photos: (item.photos || []).slice(0, 3), // 1 + 2 thumbs pequenos
         });
 
-        state.posted[item.url] = { ts: Date.now() };
+        state.posted[item.key] = { ts: Date.now(), url: item.url };
         await saveState(state);
 
         totalPublicados++;
