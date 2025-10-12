@@ -1,0 +1,68 @@
+name: Vinted Scraper
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # corre de 30 em 30 minutos
+  workflow_dispatch:         # permite "Run workflow" manual
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ↓↓↓ Busca SEMPRE o artefacto mais recente 'vinted-state'
+      - name: Download latest state artifact (vinted-state)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          fi
+          echo "Procurar artefacto 'vinted-state' mais recente..."
+          ART_ID=$(gh api repos/$REPO/actions/artifacts \
+            --paginate -q '.artifacts[] | select(.name=="vinted-state" and .expired==false) | .id' | head -n1 || true)
+          if [ -n "$ART_ID" ]; then
+            echo "Encontrado id=$ART_ID. A descarregar..."
+            gh api -H "Accept: application/vnd.github+json" \
+              repos/$REPO/actions/artifacts/$ART_ID/zip > artifact.zip
+            unzip -o artifact.zip || true
+            rm -f artifact.zip
+          else
+            echo "Sem artefactos anteriores."
+          fi
+          # Se nunca existiu, cria um estado inicial
+          if [ ! -f "vinted_state.json" ]; then
+            echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
+          fi
+          echo "State file:"
+          cat vinted_state.json
+
+      - name: Install deps
+        run: npm ci || npm i
+
+      - name: Run scraper
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
+          ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS }}
+          MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE }}
+          MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE }}
+        run: node index.js
+
+      - name: Upload state artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vinted-state
+          path: vinted_state.json
+          retention-days: 60
