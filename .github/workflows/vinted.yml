@@ -2,16 +2,8 @@ name: Vinted → Discord (Node + Puppeteer)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"        # a cada 30 minutos (UTC)
-  workflow_dispatch: {}
-
-permissions:
-  actions: read                    # necessário para listar artifacts via gh api
-  contents: read
-
-concurrency:
-  group: vinted-scraper
-  cancel-in-progress: true         # evita runs sobrepostas (menos duplicados)
+    - cron: "*/30 * * * *"    # a cada 30 minutos (UTC)
+  workflow_dispatch:
 
 jobs:
   run:
@@ -27,10 +19,11 @@ jobs:
         with:
           node-version: "20"
 
-      # ↓↓↓ PERSISTÊNCIA DE ESTADO (robusto): busca o artifact mais recente de runs anteriores
-      - name: Restore state (latest non-expired artifact)
+      # Baixar o artifact mais recente (se existir) via GitHub CLI
+      - name: Download latest state artifact (if exists)
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -e
@@ -39,21 +32,15 @@ jobs:
             sudo apt-get install -y gh
           fi
           echo "Procurar artefacto 'vinted-state' mais recente..."
-          ART_ID=$(gh api repos/$REPO/actions/artifacts \
-            --paginate -q '.artifacts[] | select(.name=="vinted-state" and .expired==false) | .id' | head -n1 || true)
+          ART_ID=$(gh api repos/$REPO/actions/artifacts --paginate -q '.artifacts[] | select(.name=="vinted-state" and .expired==false) | .id' | head -n1 || true)
           if [ -n "$ART_ID" ]; then
             echo "Encontrado id=$ART_ID. A descarregar..."
-            gh api -H "Accept: application/vnd.github+json" \
-              repos/$REPO/actions/artifacts/$ART_ID/zip > artifact.zip
+            gh api -H "Accept: application/vnd.github+json" repos/$REPO/actions/artifacts/$ART_ID/zip > artifact.zip
             unzip -o artifact.zip || true
             rm -f artifact.zip
           else
             echo "Sem artefactos anteriores."
           fi
-
-      # Se não existir, cria estado inicial
-      - name: Ensure empty state file exists
-        run: |
           if [ ! -f "vinted_state.json" ]; then
             echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
           fi
@@ -63,18 +50,21 @@ jobs:
       - name: Install deps
         run: npm ci || npm i
 
-      - name: Run scraper
+      - name: Run
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS || secrets.VINTED_PROFILE_URLS }}
           ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || '24' }}
           MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || '10' }}
+          # Aumenta se quiseres “varrer” mais por run; vazio/0 = sem limite
           MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || '5' }}
           TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
-          WEBHOOK_STYLE: ${{ vars.WEBHOOK_STYLE || '' }}
+          # Opcional: republicar após X horas (0 = nunca)
+          POSTED_TTL_HOURS: ${{ vars.POSTED_TTL_HOURS || '0' }}
+          # Para diagnóstico de skips (liga sozinho quando TEST_MODE=true)
+          DEBUG_SKIPS: ${{ vars.DEBUG_SKIPS || '' }}
         run: node index.js
 
-      # ↑↑↑ GUARDA O ESTADO ATUAL
       - name: Upload state artifact
         if: always()
         uses: actions/upload-artifact@v4
