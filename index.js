@@ -1,365 +1,486 @@
-import fs from "fs/promises";
+// index.js
+/* eslint-disable no-console */
+import fs from "fs";
+import path from "path";
+import process from "process";
 import puppeteer from "puppeteer";
-import { buildDiscordMessageForItem } from "./discordFormat.js";
 
-const fetchHttp = (typeof fetch !== "undefined")
-  ? fetch
-  : (await import("node-fetch")).default;
+// ---------- ENV ----------
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const PROFILE_URLS = (process.env.VINTED_PROFILE_URLS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-const PROFILES = (process.env.VINTED_PROFILE_URLS || "")
-  .split(",").map(u => u.trim()).filter(Boolean);
+const ONLY_NEWER_HOURS = Number(process.env.ONLY_NEWER_HOURS || 24); // filtra por idade relativa
+const MAX_ITEMS_PER_PROFILE = Number(process.env.MAX_ITEMS_PER_PROFILE || 10); // scan superficial por perfil
+const MAX_NEW_PER_PROFILE = Number(process.env.MAX_NEW_PER_PROFILE || 5); // limite de posts por perfil/run
+const TEST_MODE = String(process.env.TEST_MODE || "false").toLowerCase() === "true";
 
-const HOURS = parseInt(process.env.ONLY_NEWER_HOURS || "24", 10);
-const MAX_ITEMS_PER_PROFILE = parseInt(process.env.MAX_ITEMS_PER_PROFILE || "20", 10);
-const MAX_NEW_PER_PROFILE = parseInt(process.env.MAX_NEW_PER_PROFILE || "5", 10);
-const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
-const STATE_PATH = "vinted_state.json";
-
-const log = (...a) => console.log(...a);
-
-/* ======== DEDUPE ROBUSTO POR ID ======== */
-function extractItemId(u) {
+// ---------- STATE ----------
+const STATE_FILE = path.resolve("vinted_state.json");
+function loadState() {
   try {
-    const url = new URL(u);
-    const m = url.pathname.match(/\/items\/(\d+)/);
-    return m ? m[1] : null;
-  } catch { return null; }
-}
-function canonicalKey(u) {
-  const id = extractItemId(u);
-  return id ? `item:${id}` : (new URL(u)).origin + (new URL(u)).pathname; // fallback
-}
-/* ======================================= */
-
-async function loadState() {
-  try {
-    const raw = await fs.readFile(STATE_PATH, "utf8");
-    const s = JSON.parse(raw);
-    return { posted: s.posted || {}, lastPrune: s.lastPrune || 0 };
-  } catch {
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    // normalizar estrutura mínima
+    obj.posted ||= {};
+    obj.lastPrune ||= 0;
+    return obj;
+  } catch (e) {
     return { posted: {}, lastPrune: 0 };
   }
 }
-async function saveState(state) {
-  await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2));
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
-function pruneState(state, days = 14) {
-  const now = Date.now();
-  if (now - (state.lastPrune || 0) < 6 * 3600 * 1000) return;
-  const cutoff = now - days * 24 * 3600 * 1000;
+
+// prunes registos > 14 dias para manter leve
+function pruneState(state, now = Date.now()) {
+  const TWO_WEEKS = 14 * 24 * 3600 * 1000;
+  if (now - (state.lastPrune || 0) < 6 * 3600 * 1000) return; // só de 6h em 6h
+  let removed = 0;
   for (const [k, v] of Object.entries(state.posted)) {
-    if (!v?.ts || v.ts < cutoff) delete state.posted[k];
+    if (v?.ts && now - v.ts > TWO_WEEKS) {
+      delete state.posted[k];
+      removed++;
+    }
   }
   state.lastPrune = now;
+  if (removed) console.log(`🧹 Limpou ${removed} entradas antigas do estado.`);
 }
 
-const short = (t, m = 250) => {
-  if (!t) return "";
-  const c = t.replace(/\s+/g, " ").trim();
-  return c.length > m ? c.slice(0, m) + "..." : c;
-};
-const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000);
+// ---------- UTILS ----------
+function delay(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
 
-function parseRelativePt(text) {
-  if (!text) return null;
-  const t = text.toLowerCase();
-  if (/há\s+um(a)?\s+min/.test(t)) return new Date(Date.now() - 1 * 60 * 1000);
-  if (/há\s+um(a)?\s+hora/.test(t)) return new Date(Date.now() - 1 * 3600 * 1000);
-  if (/há\s+um(a)?\s+dia/.test(t)) return new Date(Date.now() - 24 * 3600 * 1000);
-  let m;
-  if ((m = t.match(/há\s+(\d+)\s+min/)))   return new Date(Date.now() - parseInt(m[1], 10) * 60 * 1000);
-  if ((m = t.match(/há\s+(\d+)\s+hora/)))  return new Date(Date.now() - parseInt(m[1], 10) * 3600 * 1000);
-  if ((m = t.match(/há\s+(\d+)\s+dia/)))   return new Date(Date.now() - parseInt(m[1], 10) * 24 * 3600 * 1000);
+function uniqueBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const it of arr) {
+    const k = keyFn(it);
+    if (k && !seen.has(k)) {
+      seen.add(k);
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+function extractItemIdFromUrl(url) {
+  // Ex.: https://www.vinted.pt/items/7276353124-camisola...
+  const m = String(url).match(/\/items\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+function postedKeyFor(item) {
+  if (item.id) return `item:${item.id}`;
+  return item.url; // fallback muito raro
+}
+
+// "há 35 min", "há 1 hora", "há 2 horas", "há 3 dias"
+function parsePortugueseRelative(str) {
+  if (!str) return null;
+  const s = str.toLowerCase().trim();
+
+  // Números
+  const num = (re) => {
+    const m = s.match(re);
+    if (!m) return null;
+    return Number(m[1]);
+  };
+
+  // minutos
+  let n =
+    num(/há\s+(\d+)\s*min/) ||
+    num(/há\s+(\d+)\s*mins?/) ||
+    num(/(\d+)\s*min\s*atrás/) ||
+    null;
+  if (n != null) return n * 60 * 1000;
+
+  // horas
+  n =
+    num(/há\s+(\d+)\s*h/) ||
+    num(/há\s+(\d+)\s*horas?/) ||
+    num(/(\d+)\s*h\s*atrás/) ||
+    null;
+  if (n != null) return n * 3600 * 1000;
+
+  // dias
+  n = num(/há\s+(\d+)\s*dias?/) || num(/(\d+)\s*dias?\s*atrás/);
+  if (n != null) return n * 24 * 3600 * 1000;
+
+  // "há 1 dia" explícito
+  if (/há\s*1\s*dia/.test(s)) return 24 * 3600 * 1000;
+
+  // fallback
   return null;
 }
 
-async function postToDiscord(item) {
-  if (!WEBHOOK) throw new Error("DISCORD_WEBHOOK_URL não configurado");
-  const payload = buildDiscordMessageForItem(item);
-  await fetchHttp(WEBHOOK, {
+function withinHours(msAgo, hours) {
+  if (msAgo == null) return true; // se não conseguir ler, não filtra
+  return msAgo <= hours * 3600 * 1000;
+}
+
+function formatPrice(eurosString) {
+  // Normalizar ex: "19,99 €" -> "19,99 €"; aceitar "€19.99"
+  let s = (eurosString || "").trim();
+  if (!s) return null;
+  // já vem com "€"? então usa
+  if (/[€]/.test(s)) return s;
+  // senão acrescenta
+  return `${s} €`;
+}
+
+function asDiscordTimestamp(date) {
+  // Discord formatação relativa: <t:unix:R>
+  const unix = Math.floor(date.getTime() / 1000);
+  return `<t:${unix}:R>`;
+}
+
+// ---------- DISCORD ----------
+async function sendToDiscord({ item, footerBrand = "Comunidade GRANITO . Vinted Updates" }) {
+  if (!DISCORD_WEBHOOK_URL) {
+    console.warn("⚠️ DISCORD_WEBHOOK_URL não definido — a ignorar envio.");
+    return;
+  }
+
+  const title = item.title || "Novo artigo no Vinted";
+  const url = item.url;
+  const price = item.price || "—";
+  const size = item.size || "—";
+  const brand = item.brand || "—";
+  const condition = item.condition || "—";
+  const postedRel = item.postedRel || null; // string "há X"
+  const sellerFeedbacks = item.sellerFeedbacks ?? null;
+
+  // imagens: principal + extra
+  const img1 = item.images?.[0] || null;
+  const img2 = item.images?.[1] || null;
+
+  const fields = [
+    { name: "💰 Preço", value: price, inline: true },
+    { name: "📐 Tamanho", value: size, inline: true },
+    { name: "🏷️ Marca", value: brand, inline: true },
+    { name: "✨ Estado", value: condition, inline: true },
+  ];
+
+  if (sellerFeedbacks != null) {
+    fields.push({ name: "⭐ Opiniões do vendedor", value: String(sellerFeedbacks), inline: true });
+  }
+  if (postedRel) {
+    fields.push({ name: "⏱️ Publicado", value: postedRel, inline: true });
+  }
+
+  // Footer: "Clara Oliveira • Vinted • Bot • 11/10/2025 13:15 - Comunidade GRANITO . Vinted  Updates"
+  const now = new Date();
+  const pt = new Intl.DateTimeFormat("pt-PT", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(now);
+
+  const footerText = `Clara Oliveira • Vinted • Bot • ${pt} - ${footerBrand}`;
+
+  const embed = {
+    type: "rich",
+    title: `👕 ${title}`,
+    url,
+    fields,
+    footer: { text: footerText },
+  };
+
+  // meter imagem principal como image e a extra como thumbnail (duas imagens no mesmo embed)
+  if (img1) embed.image = { url: img1 };
+  if (img2) embed.thumbnail = { url: img2 };
+
+  const components = [
+    {
+      type: 1, // action row
+      components: [
+        {
+          type: 2, // button
+          style: 5, // link button
+          label: "Comprar",
+          url,
+        },
+      ],
+    },
+  ];
+
+  const payload = {
+    content: "", // sem texto solto
+    embeds: [embed],
+    components,
+  };
+
+  if (TEST_MODE) {
+    console.log("🧪 TEST_MODE ativo — Payload Discord:");
+    console.dir(payload, { depth: 5 });
+    return;
+  }
+
+  const res = await fetch(DISCORD_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-}
-
-async function autoScroll(page, steps = 10, stepPx = 1200, delayMs = 300) {
-  for (let i = 0; i < steps; i++) {
-    await page.evaluate(y => window.scrollBy(0, y), stepPx);
-    if (page.waitForTimeout) await page.waitForTimeout(delayMs);
-    else await new Promise(r => setTimeout(r, delayMs));
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Falha no webhook Discord: ${res.status} ${res.statusText} ${t}`);
   }
-  await page.evaluate(() => window.scrollTo(0, 0));
-}
-async function ensureAtLeastOneItemLink(page, timeoutMs = 10000) {
-  try { await page.waitForSelector('a[href*="/items/"]', { timeout: timeoutMs }); } catch {}
 }
 
-async function scrapeProfile(browser, url) {
+// ---------- SCRAPER ----------
+async function scrapeProfile(browser, profileUrl) {
+  // devolve uma lista superficial de {id,url} do perfil
   const page = await browser.newPage();
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForSelector("body", { timeout: 30000 }).catch(() => null);
-  await autoScroll(page, 12, 1400, 200);
-  await ensureAtLeastOneItemLink(page);
+  page.setDefaultNavigationTimeout(60_000);
+  page.setDefaultTimeout(30_000);
+  const results = [];
+  try {
+    await page.goto(profileUrl, { waitUntil: "networkidle2" });
+    await delay(1500);
 
-  const rawLinks = await page.$$eval('a[href*="/items/"]', (links) =>
-    links.map((a) => a.href)
-  );
+    // procurar links para /items/<id>
+    const links = await page.$$eval('a[href*="/items/"]', (as) =>
+      as.map((a) => a.href).filter((u) => /\/items\/\d+/.test(u))
+    );
 
-  // normalizar: remover dupes por ID
-  const byId = new Map();
-  for (const href of rawLinks) {
-    const id = extractItemId(href);
-    if (!id) continue;
-    if (!byId.has(id)) byId.set(id, href);
-  }
-  const links = Array.from(byId.values()).slice(0, MAX_ITEMS_PER_PROFILE);
-
-  const out = [];
-  for (const link of links) {
-    try {
-      const it = await scrapeItem(browser, link);
-      if (it) out.push(it);
-    } catch (e) {
-      log("  • Erro a extrair item:", e.message);
+    const uniq = Array.from(new Set(links)).slice(0, MAX_ITEMS_PER_PROFILE);
+    for (const url of uniq) {
+      const id = (url.match(/\/items\/(\d+)/) || [])[1] || null;
+      if (!id) continue;
+      results.push({ id, url });
     }
+  } catch (e) {
+    console.warn(`⚠️ Falha a ler perfil ${profileUrl}:`, e.message);
+  } finally {
+    await page.close().catch(() => {});
   }
-  await page.close();
-  return out;
+  return uniqueBy(results, (x) => x.id);
 }
 
-async function scrapeItem(browser, link) {
+async function scrapeItem(browser, itemUrl) {
+  // visita a página do item e extrai os campos necessários
   const page = await browser.newPage();
-  await page.goto(link, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForSelector("body", { timeout: 30000 }).catch(() => null);
-  await autoScroll(page, 2, 800, 150);
+  page.setDefaultNavigationTimeout(60_000);
+  page.setDefaultTimeout(30_000);
 
-  const data = await page.evaluate(() => {
-    const getMeta = (prop) =>
-      document.querySelector(`meta[property="${prop}"]`)?.getAttribute("content") ||
-      document.querySelector(`meta[name="${prop}"]`)?.getAttribute("content") ||
-      "";
+  const item = {
+    id: extractItemIdFromUrl(itemUrl),
+    url: itemUrl,
+    title: null,
+    price: null,
+    size: null,
+    brand: null,
+    condition: null,
+    postedRel: null, // "há X min"
+    images: [],
+    sellerFeedbacks: null,
+  };
 
-    const sidebar = document.querySelector('[data-testid="sidebar"]') || document;
-    const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+  try {
+    await page.goto(itemUrl, { waitUntil: "networkidle2" });
+    await delay(1500);
 
-    const textOf = (sel, root = document) => root.querySelector(sel)?.textContent?.trim() || "";
-    const title = textOf("h1") || document.title || "";
-
-    // --- PREÇO muito robusto (JSON-LD → scripts → meta → UI) ---
-    let price = "", priceText = "", currency = "";
-
+    // Título
     try {
-      const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-        .map(s => s.textContent)
-        .filter(Boolean)
-        .map(t => { try { return JSON.parse(t); } catch { return null; } })
-        .filter(Boolean);
-      for (const blob of ld) {
-        const arr = Array.isArray(blob) ? blob : [blob];
-        for (const obj of arr) {
-          if (obj?.['@type'] === 'Product') {
-            const offers = Array.isArray(obj.offers) ? obj.offers : (obj.offers ? [obj.offers] : []);
-            const off = offers.find(o => o.price);
-            if (off?.price) {
-              price = String(off.price);
-              currency = (off.priceCurrency || "EUR").toUpperCase();
-              priceText = off.priceCurrency ? `${off.price} ${off.priceCurrency}` : String(off.price);
-              break;
+      item.title =
+        (await page.$eval("h1", (el) => el.textContent?.trim())) ||
+        (await page.$eval('[data-testid*="title"]', (el) => el.textContent?.trim()));
+    } catch {}
+
+    // Preço (vários seletores de fallback)
+    try {
+      item.price =
+        (await page.$eval('[data-testid*="price"]', (el) => el.textContent?.trim())) ||
+        (await page.$eval('div:has(span:contains("€"))', (el) => el.textContent?.trim()));
+      item.price = formatPrice(item.price);
+    } catch {}
+
+    // Detalhes (marca, tamanho, estado) – usar labels comuns
+    const getDetailByLabel = async (labels) => {
+      const text = await page.evaluate((ls) => {
+        const norm = (s) => s.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+        const lbls = ls.map(norm);
+        const all = Array.from(document.querySelectorAll("*")).slice(0, 2000);
+        for (const el of all) {
+          const t = (el.textContent || "").trim();
+          const tn = norm(t);
+          // procurar um container "Label: Valor"
+          for (const l of lbls) {
+            if (tn.startsWith(l + ":")) {
+              return t.split(":").slice(1).join(":").trim();
             }
           }
         }
-      }
+        return null;
+      }, labels);
+      return text;
+    };
+
+    // Tentativas por seletores específicos de ficha técnica
+    async function trySpecRow(labelVariants) {
+      return await page.evaluate((labels) => {
+        const norm = (s) => s.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+        const lbls = labels.map(norm);
+        // tabelas/dl/linhas de detalhes
+        const rows = document.querySelectorAll("tr, li, div, dt, dd, span");
+        for (const r of rows) {
+          const txt = (r.textContent || "").trim();
+          const n = norm(txt);
+          for (const l of lbls) {
+            // "Marca", "Tamanho", "Estado"
+            if (n.includes(l)) {
+              // tenta apanhar valor depois de ":"
+              const parts = txt.split(":");
+              if (parts.length > 1) return parts.slice(1).join(":").trim();
+            }
+          }
+        }
+        return null;
+      }, labelVariants);
+    }
+
+    item.brand =
+      (await trySpecRow(["Marca", "Brand"])) || (await getDetailByLabel(["Marca", "Brand"]));
+
+    item.size =
+      (await trySpecRow(["Tamanho", "Size"])) || (await getDetailByLabel(["Tamanho", "Size"]));
+
+    item.condition =
+      (await trySpecRow(["Estado", "Condition"])) ||
+      (await getDetailByLabel(["Estado", "Condition"]));
+
+    // “há X …” (tempo relativo)
+    try {
+      const rel = await page.evaluate(() => {
+        const cand = Array.from(document.querySelectorAll("*"))
+          .map((el) => (el.textContent || "").trim())
+          .filter((t) => /há\s+\d+/.test(t.toLowerCase()) || /min\s*atrás|h\s*atrás|dias\s*atrás/.test(t.toLowerCase()))
+          .sort((a, b) => a.length - b.length);
+        return cand[0] || null;
+      });
+      item.postedRel = rel ? rel.replace(/\s+/g, " ") : null;
     } catch {}
 
-    if (!price) {
-      const scripts = Array.from(document.querySelectorAll("script"))
-        .map(s => s.textContent || "")
-        .filter(t => /price/i.test(t) && t.length < 2_000_000);
-      for (const t of scripts) {
-        let m = t.match(/"price"\s*:\s*"?(?<p>[\d.,]+)"?/i);
-        if (m?.groups?.p) {
-          price = m.groups.p;
-          const c = t.match(/"currency"\s*:\s*"(?<c>[A-Z]{3})"/i)?.groups?.c;
-          currency = (c || "EUR").toUpperCase();
-          break;
-        }
-      }
-    }
-
-    if (!price) {
-      const metaAmount = getMeta("product:price:amount") || getMeta("og:price:amount");
-      const metaCurrency = getMeta("product:price:currency") || getMeta("og:price:currency");
-      if (metaAmount) {
-        price = metaAmount.trim();
-        currency = (metaCurrency || "EUR").trim().toUpperCase();
-      }
-    }
-
-    if (!price) {
-      const sideTxt = (sidebar.innerText || "").replace(/\s+/g, " ");
-      let m = sideTxt.match(/[€£$]\s*\d[\d.,]*/) ||
-              sideTxt.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
-      if (!m) {
-        const btnTxt = Array.from(document.querySelectorAll("button, a"))
-          .map(el => el.textContent?.replace(/\s+/g, " ").trim() || "")
-          .filter(Boolean)
-          .join(" | ");
-        m = btnTxt.match(/[€£$]\s*\d[\d.,]*/) ||
-            btnTxt.match(/\b\d[\d.,]*\s*(€|EUR|GBP|USD)\b/i);
-      }
-      if (m) {
-        const s = m[0];
-        priceText = s;
-        if (/^[€£$]/.test(s)) {
-          currency = s[0] === "€" ? "EUR" : (s[0] === "£" ? "GBP" : "USD");
-          price = s.replace(/[€£$\s]/g, "");
-        } else {
-          const parts = s.trim().split(/\s+/);
-          price = parts[0];
-          const cur = (parts[1] || "").toUpperCase();
-          currency = cur === "€" ? "EUR" : cur;
-        }
-      }
-    }
-
-    const findRowValue = (label) => {
-      const root = sidebar;
-      const rows = Array.from(root.querySelectorAll("div,li,dt,section"));
-      const target = rows.find(el => el.textContent.trim().toLowerCase().startsWith(label.toLowerCase()));
-      if (!target) return "";
-      const firstLink = target.querySelector("a");
-      if (firstLink?.textContent) return firstLink.textContent.trim();
-      const labEl = Array.from(target.querySelectorAll("span,div,dt")).find(
-        el => el.textContent.trim().toLowerCase() === label.toLowerCase()
+    // imagens
+    try {
+      const imgs = await page.$$eval("img", (els) =>
+        els
+          .map((img) => img.src || img.getAttribute("src") || "")
+          .filter((u) => /^https?:/.test(u) && !u.includes("placeholder"))
       );
-      if (labEl?.nextElementSibling?.textContent)
-        return labEl.nextElementSibling.textContent.trim();
-      return target.textContent.replace(new RegExp("^" + label, "i"), "").trim();
-    };
+      // ordenar por resolução desc (heurística simples)
+      const uniq = Array.from(new Set(imgs));
+      // filtrar só as do item (heurística: tem "/images/" e não é avatar)
+      const productish = uniq.filter((u) => /\/images?\//.test(u) || /\/items?\//.test(u));
+      item.images = productish.slice(0, 2); // principal + 1 extra
+    } catch {}
 
-    let brand = findRowValue("Marca")
-      .replace(/Menu da marca/gi, "")
-      .split(/›|>/)[0]
-      .split("\n")[0]
-      .trim();
-
-    const size = findRowValue("Tamanho");
-    const condition = findRowValue("Estado");
-    const loadedAgo = findRowValue("Carregado");
-
-    let feedbacks = null;
-    const fbMatch =
-      bodyText.match(/(Feedbacks|Opiniões|Avaliações)\s*\((\d+)\)/i) ||
-      bodyText.match(/⭐\s*\((\d+)\)/i);
-    if (fbMatch) {
-      feedbacks = parseInt(fbMatch[2] || fbMatch[1], 10);
-      if (Number.isNaN(feedbacks)) feedbacks = null;
-    }
-
-    const urls = new Set();
-    const ogImage = getMeta("og:image");
-    if (ogImage) urls.add(ogImage);
-    document.querySelectorAll("img").forEach(img => {
-      const ss = img.getAttribute("srcset") || img.getAttribute("data-srcset");
-      if (ss) {
-        const candidate = ss.split(",").map(s => s.trim().split(" ")[0]).filter(Boolean).pop();
-        if (candidate && /^https?:\/\//i.test(candidate)) urls.add(candidate);
+    // nº de feedbacks do vendedor
+    try {
+      const fbText = await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll("*"));
+        const pts = all
+          .map((el) => (el.textContent || "").trim())
+          .filter(Boolean);
+        // procurar “opiniões”, “avaliações”, “feedback”
+        const hit =
+          pts.find((t) => /opini(ões|oes)/i.test(t) && /\d+/.test(t)) ||
+          pts.find((t) => /avali(a|á)ções/i.test(t) && /\d+/.test(t)) ||
+          pts.find((t) => /feedback/i.test(t) && /\d+/.test(t));
+        return hit || null;
+      });
+      if (fbText) {
+        const m = fbText.match(/(\d[\d\.]*)/);
+        if (m) item.sellerFeedbacks = Number(m[1].replace(/\./g, ""));
       }
-      const src = img.getAttribute("src") || img.getAttribute("data-src");
-      if (src && /^https?:\/\//i.test(src)) urls.add(src);
-    });
-
-    const priceNorm = price ? price.replace(/\s/g, "") : "";
-    const priceTextFinal = (priceText || (priceNorm
-      ? ((currency === "EUR" ? "€ " : "") + priceNorm.replace(/\./g, ","))
-      : "")).trim();
-
-    return {
-      title,
-      url: location.href,
-      description: "",
-      price: priceNorm,
-      priceText: priceTextFinal,
-      currency,
-      brand,
-      size,
-      condition,
-      loadedAgo,
-      feedbacks,
-      photos: Array.from(urls).slice(0, 6),
-    };
-  });
-
-  await page.close();
-  return data;
+    } catch {}
+  } catch (e) {
+    console.warn(`⚠️ Falha a ler item ${itemUrl}:`, e.message);
+  } finally {
+    await page.close().catch(() => {});
+  }
+  return item;
 }
 
-run().catch((err) => {
-  console.error("Erro fatal:", err);
-  process.exit(1);
-});
-
-async function run() {
-  if (!PROFILES.length) {
-    console.error("Nenhum perfil configurado!");
-    return;
+// ---------- MAIN ----------
+(async () => {
+  if (!PROFILE_URLS.length) {
+    console.error("❌ VINTED_PROFILE_URLS está vazio.");
+    process.exit(1);
   }
-
-  const state = await loadState();
+  const state = loadState();
   pruneState(state);
 
-  const cutoff = hoursAgo(HOURS);
-  log(`🔎 A verificar ${PROFILES.length} perfis (últimas ${HOURS}h) ...`);
+  console.log(
+    `🔎 A verificar ${PROFILE_URLS.length} perfis (últimas ${ONLY_NEWER_HOURS}h) ...`
+  );
 
   const browser = await puppeteer.launch({
     headless: "new",
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
-  let totalEncontrados = 0;
-  let totalPublicados = 0;
+  let totalFound = 0;
+  let totalPosted = 0;
 
-  for (const profile of PROFILES) {
-    log(`→ Perfil: ${profile}`);
+  try {
+    for (const profileUrl of PROFILE_URLS) {
+      console.log(`→ Perfil: ${profileUrl}`);
 
-    try {
-      const items = await scrapeProfile(browser, profile);
-      totalEncontrados += items.length;
+      const shallow = await scrapeProfile(browser, profileUrl);
+      // limitar superficial
+      const candidates = shallow.slice(0, MAX_ITEMS_PER_PROFILE);
+      totalFound += candidates.length;
 
-      for (const it of items) {
-        const dt = parseRelativePt(it.loadedAgo);
-        it.createdAt = dt ? dt.toISOString() : new Date().toISOString();
+      const toPost = [];
+      for (const c of candidates) {
+        const key = postedKeyFor(c);
+        if (state.posted[key]) {
+          // já publicado anteriormente — salta
+          continue;
+        }
+        // carregar detalhes do item
+        const full = await scrapeItem(browser, c.url);
 
-        // chave canónica por ID
-        it.key = canonicalKey(it.url);
+        // aplicar janela de “apenas recentes”
+        let passTime = true;
+        if (ONLY_NEWER_HOURS > 0 && full.postedRel) {
+          const msAgo = parsePortugueseRelative(full.postedRel);
+          passTime = withinHours(msAgo, ONLY_NEWER_HOURS);
+        }
+
+        if (!passTime) continue;
+        toPost.push(full);
+
+        // respeitar limite de novos por perfil
+        if (toPost.length >= MAX_NEW_PER_PROFILE) break;
       }
 
-      const candidatos = items
-        .filter(it => new Date(it.createdAt) >= cutoff)
-        .filter(it => it.key && !state.posted[it.key]);  // DEDUPE
-
-      const toPost = candidatos.slice(0, MAX_NEW_PER_PROFILE);
-
+      // publicar
       for (const item of toPost) {
-        await postToDiscord({
-          ...item,
-          description: short(item.description, 280),
-          photos: (item.photos || []).slice(0, 3), // 1 + 2 thumbs pequenos
-        });
-
-        state.posted[item.key] = { ts: Date.now(), url: item.url };
-        await saveState(state);
-
-        totalPublicados++;
-        await new Promise(r => setTimeout(r, 800));
+        try {
+          await sendToDiscord({ item });
+          const key = postedKeyFor(item);
+          state.posted[key] = { ts: Date.now(), url: item.url };
+          totalPosted++;
+          // pequeno intervalo para não “bombardear”
+          await delay(800);
+        } catch (e) {
+          console.error("❌ Erro ao publicar no Discord:", e.message);
+        }
       }
-    } catch (err) {
-      log("Erro geral:", err.message);
     }
+  } finally {
+    await browser.close().catch(() => {});
+    saveState(state);
   }
 
-  await browser.close();
-  await saveState(state);
-  log(`📦 Resumo: encontrados=${totalEncontrados}, publicados=${totalPublicados}`);
-}
+  console.log(`📦 Resumo: encontrados=${totalFound}, publicados=${totalPosted}`);
+})();
