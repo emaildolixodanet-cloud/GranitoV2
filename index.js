@@ -1,256 +1,264 @@
-// ESM
-import fs from "node:fs/promises";
-import path from "node:path";
-import process from "node:process";
 import puppeteer from "puppeteer";
+import fs from "fs/promises";
+import fetch from "node-fetch";
 
-const STATE_FILE = path.resolve("vinted_state.json");
+// ---------- Config via ENV ----------
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+if (!WEBHOOK_URL) {
+  console.error("❌ Falta DISCORD_WEBHOOK_URL nos Secrets.");
+  process.exit(1);
+}
 
-// ───────────── Estado ─────────────
+const PROFILE_URLS = (process.env.VINTED_PROFILE_URLS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+if (PROFILE_URLS.length === 0) {
+  console.error("❌ VINTED_PROFILE_URLS vazio. Defina em Repository Variables.");
+  process.exit(1);
+}
+
+const ONLY_NEWER_HOURS = Number(process.env.ONLY_NEWER_HOURS || 24);
+const MAX_ITEMS_PER_PROFILE = Number(process.env.MAX_ITEMS_PER_PROFILE || 10);
+const MAX_NEW_PER_PROFILE = Number(process.env.MAX_NEW_PER_PROFILE || 5);
+const TEST_MODE = String(process.env.TEST_MODE || "false").toLowerCase() === "true";
+
+const STATE_FILE = "vinted_state.json";
+const NOW = Date.now();
+const cutoffMs = NOW - ONLY_NEWER_HOURS * 60 * 60 * 1000;
+
+// ---------- Utils ----------
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
 async function loadState() {
   try {
     const raw = await fs.readFile(STATE_FILE, "utf8");
-    const s = JSON.parse(raw || "{}");
-    return { posted: s.posted || {}, lastPrune: s.lastPrune || 0 };
+    return JSON.parse(raw);
   } catch {
     return { posted: {}, lastPrune: 0 };
   }
 }
+
 async function saveState(state) {
   await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
 }
-function normalizeKey(url) {
-  const m = String(url).match(/\/items\/(\d+)/);
-  return m ? `item:${m[1]}` : url;
+
+function sanitizeText(s) {
+  if (!s && s !== 0) return undefined;
+  const t = String(s).trim();
+  return t.length ? t : undefined;
 }
 
-// ───────────── Scraper ─────────────
-async function scrapeProfile(browser, profileUrl, maxItems) {
-  const page = await browser.newPage();
-  page.setDefaultNavigationTimeout(60000);
+function toDiscordEmbed(item) {
+  const title = sanitizeText(item.title) || "Novo artigo no Vinted";
+  const url = sanitizeText(item.url);
+  const price = sanitizeText(item.price);
+  const size = sanitizeText(item.size);
+  const brand = sanitizeText(item.brand);
+  const user = sanitizeText(item.seller);
 
-  const url = profileUrl.includes("?")
-    ? `${profileUrl}&order=newest_first`
-    : `${profileUrl}?order=newest_first`;
+  const descriptionParts = [];
+  if (brand) descriptionParts.push(`**Marca:** ${brand}`);
+  if (size) descriptionParts.push(`**Tamanho:** ${size}`);
+  if (price) descriptionParts.push(`**Preço:** ${price}`);
+  const description = descriptionParts.join(" · ");
 
-  await page.goto(url, { waitUntil: "domcontentloaded" });
+  // Nunca enviar campos vazios ao Discord
+  const embed = {
+    title,
+    url,
+    description: sanitizeText(description),
+    thumbnail: item.photo ? { url: item.photo } : undefined,
+    footer: user ? { text: `Vendedor: ${user}` } : undefined,
+    timestamp: new Date(item.ts).toISOString(),
+    color: 0x2a9d8f // verde teal
+  };
 
-  // Espera por items. Fallback rápido caso nada apareça
-  const itemSelector = 'a[href*="/items/"]';
-  try {
-    await page.waitForSelector(itemSelector, { timeout: 15000 });
-  } catch {
-    await new Promise((r) => setTimeout(r, 2000));
+  // limpar undefineds
+  Object.keys(embed).forEach((k) => embed[k] === undefined && delete embed[k]);
+  return embed;
+}
+
+async function postToDiscord(items) {
+  if (!items.length) return { ok: true, posted: 0 };
+
+  // Discord: max 10 embeds por payload – enviamos em lotes de até 10
+  const chunks = [];
+  for (let i = 0; i < items.length; i += 10) {
+    chunks.push(items.slice(i, i + 10));
   }
 
-  if (typeof page.waitForNetworkIdle === "function") {
-    try {
-      await page.waitForNetworkIdle({ idleTime: 800, timeout: 8000 });
-    } catch {}
+  let posted = 0;
+  for (const chunk of chunks) {
+    const embeds = chunk.map(toDiscordEmbed).filter(e => e && typeof e === "object");
+    if (!embeds.length) continue;
+
+    const payload = { embeds };
+    const res = await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error(`❌ Falha no webhook Discord: ${res.status} ${res.statusText} ${body}`);
+      // Não abortar o job por 1 lote falhado
+      continue;
+    }
+    posted += embeds.length;
+    await sleep(1200); // pequena pausa para não bater rate limit
+  }
+  return { ok: true, posted };
+}
+
+// ---------- Scraper ----------
+async function scrapeProfile(page, profileUrl) {
+  // Nota: este seletor e parsing são “genéricos”. Se o teu HTML do Vinted
+  // mudou, ajusta os seletores abaixo.
+  await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await sleep(1500);
+
+  // tentar carregar mais items (scroll simples)
+  for (let i = 0; i < 4; i++) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await sleep(1000);
   }
 
   const items = await page.evaluate(() => {
-    const anchors = [...document.querySelectorAll('a[href*="/items/"]')]
-      .filter((a) => /\/items\/\d+/.test(a.getAttribute("href") || ""));
-    const map = new Map();
-    for (const a of anchors) {
-      const href = a.href;
-      if (map.has(href)) continue;
+    const list = [];
+    // Ajusta este seletor ao layout atual do Vinted
+    const cards = document.querySelectorAll('a[href*="/items/"]');
 
-      const root = a.closest("article,li,div") || a;
+    cards.forEach((a) => {
+      const url = a.href;
       const title =
-        root.querySelector('[data-testid*="title"],[class*="title"],[title]')?.textContent?.trim() ||
         a.getAttribute("title") ||
-        "Artigo no Vinted";
-
-      // tentativas para apanhar preço/descrição/imagem
+        a.querySelector("[data-testid='item-title']")?.textContent ||
+        a.querySelector("h3,h2")?.textContent ||
+        "";
       const price =
-        root.querySelector('[data-testid*="price"],[class*="price"]')?.textContent?.trim() ||
-        null;
+        a.querySelector("[data-testid='item-price']")?.textContent ||
+        a.querySelector(".price")?.textContent ||
+        "";
+      const size =
+        a.querySelector("[data-testid='item-size']")?.textContent ||
+        a.querySelector(".size")?.textContent ||
+        "";
+      const brand =
+        a.querySelector("[data-testid='item-brand']")?.textContent ||
+        a.querySelector(".brand")?.textContent ||
+        "";
+      const img =
+        a.querySelector("img")?.src ||
+        a.querySelector("img")?.getAttribute("data-src") ||
+        "";
 
-      const image =
-        root.querySelector("img")?.src ||
-        root.querySelector('img[loading="lazy"]')?.src ||
-        null;
+      if (!url.includes("/items/")) return;
 
-      map.set(href, { url: href, title, price, image });
-    }
-    return Array.from(map.values());
-  });
-
-  await page.close();
-  return items.slice(0, maxItems);
-}
-
-// ───────────── Discord (1 mensagem por item) ─────────────
-async function postEmbed(webhookUrl, embedPayload, { username, avatar_url } = {}) {
-  const body = {
-    username,
-    avatar_url,
-    allowed_mentions: { parse: [] },
-    ...embedPayload,
-  };
-
-  // Retry básico com backoff e suporte a Retry-After
-  let attempts = 0;
-  while (attempts < 4) {
-    attempts++;
-    const res = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      list.push({
+        url,
+        title: title?.trim(),
+        price: price?.trim(),
+        size: size?.trim(),
+        brand: brand?.trim(),
+        photo: img || null
+      });
     });
 
-    if (res.ok) return true;
-
-    if (res.status === 429) {
-      // tenta ler Retry-After (segundos) ou espera 2s
-      const ra = Number(res.headers.get("retry-after") || 0);
-      await new Promise((r) => setTimeout(r, Math.max(2000, ra * 1000)));
-      continue;
-    }
-
-    // Para debug mais claro
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Webhook falhou: ${res.status} ${res.statusText} ${txt}`);
-  }
-  throw new Error("Webhook falhou após várias tentativas (429).");
-}
-
-function buildEmbedForItem(it, profileLabel = "Vinted") {
-  const fields = [];
-  if (it.price) fields.push({ name: "Preço", value: `\`${it.price}\``, inline: true });
-
-  return {
-    content: "", // evitar duplicar texto; só embed
-    embeds: [
-      {
-        title: it.title?.slice(0, 240) || "Novo artigo",
-        url: it.url,
-        description: "🧱 Novo artigo adicionado",
-        thumbnail: it.image ? { url: it.image } : undefined,
-        fields,
-        footer: { text: profileLabel },
-        timestamp: new Date().toISOString(),
-      },
-    ],
-  };
-}
-
-// ───────────── MAIN ─────────────
-(async () => {
-  const {
-    DISCORD_WEBHOOK_URL,
-    VINTED_PROFILE_URLS = "",
-    ONLY_NEWER_HOURS = "24",
-    MAX_ITEMS_PER_PROFILE = "10",
-    MAX_NEW_PER_PROFILE = "5",
-    TEST_MODE = "false",
-    WEBHOOK_USERNAME = "Granito V2",
-    WEBHOOK_AVATAR_URL = "", // opcional
-  } = process.env;
-
-  if (!DISCORD_WEBHOOK_URL) {
-    console.error("❌ Falta DISCORD_WEBHOOK_URL");
-    process.exit(1);
-  }
-
-  const profiles = VINTED_PROFILE_URLS.split(",").map((s) => s.trim()).filter(Boolean);
-  if (!profiles.length) {
-    console.error("❌ Falta VINTED_PROFILE_URLS");
-    process.exit(1);
-  }
-
-  const onlyNewerMs = Number(ONLY_NEWER_HOURS) * 3600 * 1000;
-  const maxItems = Number(MAX_ITEMS_PER_PROFILE);
-  const maxNew = Number(MAX_NEW_PER_PROFILE);
-  const isTest = String(TEST_MODE).toLowerCase() === "true";
-
-  const state = await loadState();
-  const now = Date.now();
-
-  // limpeza periódica (3 dias) mantendo 15 dias de histórico
-  if (now - (state.lastPrune || 0) > 3 * 24 * 3600 * 1000) {
-    const keep = {};
-    for (const [k, v] of Object.entries(state.posted)) {
-      if (now - (v?.ts || 0) <= 15 * 24 * 3600 * 1000) keep[k] = v;
-    }
-    state.posted = keep;
-    state.lastPrune = now;
-  }
-
-  console.log(`🔎 A verificar ${profiles.length} perfis (últimas ${ONLY_NEWER_HOURS}h) ...`);
-
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    // remover duplicados por URL
+    const seen = new Set();
+    return list.filter((i) => {
+      if (seen.has(i.url)) return false;
+      seen.add(i.url);
+      return true;
+    });
   });
 
-  const candidates = [];
+  // anexar info extra
+  const enriched = items.slice(0, MAX_ITEMS_PER_PROFILE).map((i) => ({
+    ...i,
+    seller: profileUrl.replace(/^https?:\/\//, "").split("/")[1] || "vendedor",
+    ts: Date.now() // sem API oficial, usamos “agora” (o filtro temporal é à hora da run)
+  }));
+
+  return enriched;
+}
+
+// ---------- Main ----------
+(async () => {
+  const state = await loadState();
+  let found = 0;
+  let toPublish = [];
+
+  console.log(`🔎 A verificar ${PROFILE_URLS.length} perfis (últimas ${ONLY_NEWER_HOURS}h) ...`);
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
 
   try {
-    for (const profile of profiles) {
-      console.log(`→ Perfil: ${profile}`);
-      let items = [];
+    for (const url of PROFILE_URLS) {
+      console.log(`→ Perfil: ${url}`);
+      const page = await browser.newPage();
+
       try {
-        items = await scrapeProfile(browser, profile, maxItems);
-      } catch (e) {
-        console.error(`⚠️ Erro a scrapar ${profile}: ${e.message}`);
-        continue;
+        const items = await scrapeProfile(page, url);
+        found += items.length;
+
+        // filtro temporal + já publicados
+        const fresh = items
+          .filter((i) => i.ts >= cutoffMs)
+          .filter((i) => {
+            const key = state.posted[i.url] ? i.url : `item:${(i.url.match(/\/items\/(\d+)/) || [])[1] || i.url}`;
+            return !state.posted[key];
+          })
+          .slice(0, MAX_NEW_PER_PROFILE);
+
+        // registar para publicar
+        toPublish.push(...fresh);
+      } catch (err) {
+        console.warn(`⚠️ Erro a scrapar ${url}: ${err.message}`);
+      } finally {
+        await page.close().catch(() => {});
       }
-
-      const fresh = [];
-      for (const it of items) {
-        const key = normalizeKey(it.url);
-        if (state.posted[key]) continue; // já publicado no passado
-
-        // como não lemos timestamp do Vinted, aplicamos janela pela descoberta
-        const within = Date.now() >= now - onlyNewerMs;
-        if (!within) continue;
-
-        fresh.push(it);
-        if (fresh.length >= maxNew) break;
-      }
-      candidates.push(...fresh);
     }
   } finally {
     await browser.close().catch(() => {});
   }
 
-  console.log(`📦 Resumo: encontrados=${candidates.length}, a_publicar=${candidates.length}`);
+  // limitar total a publicar por run (opcional – aqui não limitamos globalmente)
+  const willPublish = TEST_MODE ? [] : toPublish;
 
-  if (!candidates.length) {
-    await saveState(state);
-    return;
+  // publicar no Discord
+  const result = await postToDiscord(willPublish);
+
+  // atualizar estado
+  const nowTs = Date.now();
+  for (const it of willPublish) {
+    // guardar por URL e também por id normalizado (evita reposts se URL mudar com slug)
+    const idMatch = it.url.match(/\/items\/(\d+)/);
+    const keyById = idMatch ? `item:${idMatch[1]}` : null;
+
+    state.posted[it.url] = { ts: nowTs, url: it.url };
+    if (keyById) state.posted[keyById] = { ts: nowTs, url: it.url };
   }
 
-  let postedCount = 0;
-
-  for (const it of candidates) {
-    const key = normalizeKey(it.url);
-
-    const embed = buildEmbedForItem(it);
-    if (!isTest) {
-      try {
-        await postEmbed(
-          DISCORD_WEBHOOK_URL,
-          embed,
-          { username: WEBHOOK_USERNAME, avatar_url: WEBHOOK_AVATAR_URL }
-        );
-        // só marca como postado se correu bem
-        state.posted[key] = { ts: Date.now(), url: it.url };
-        postedCount++;
-        console.log(`✅ Publicado: ${it.url}`);
-        // Respeitar ligeiramente rate limits
-        await new Promise((r) => setTimeout(r, 500));
-      } catch (err) {
-        console.error(`❌ Erro ao publicar ${it.url}: ${err.message}`);
-      }
-    } else {
-      console.log(`🧪 TEST_MODE → (simulado) ${it.url}`);
+  // pruning ocasional do mapa posted (mantém últimos 7 dias)
+  if (!state.lastPrune || nowTs - state.lastPrune > 24 * 60 * 60 * 1000) {
+    const sevenDaysAgo = nowTs - 7 * 24 * 60 * 60 * 1000;
+    for (const [k, v] of Object.entries(state.posted)) {
+      if (!v?.ts || v.ts < sevenDaysAgo) delete state.posted[k];
     }
+    state.lastPrune = nowTs;
   }
 
-  console.log(`🧾 Publicados com sucesso: ${postedCount}/${candidates.length}`);
   await saveState(state);
+
+  console.log(`📦 Resumo: encontrados=${found}, a_publicar=${willPublish.length}`);
+  if (TEST_MODE) {
+    console.log("🧪 TEST_MODE=TRUE → não publicou no Discord.");
+  }
 })();
