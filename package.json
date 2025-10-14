@@ -1,13 +1,13 @@
 {
   "name": "granito-vinted",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "puppeteer": "^24.3.0",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^24.3.0"
   }
 }
