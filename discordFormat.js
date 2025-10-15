@@ -1,91 +1,108 @@
-// discordFormat.js (ESM)
-import fetch from "node-fetch";
-
-/** Util: corta strings para não rebentar limites do Discord */
-const cut = (s, n) => (s ? String(s).slice(0, n) : "");
+// discordFormat.js — versão PT-PT
+import sharp from "sharp";
+import axios from "axios";
 
 /**
- * Constrói um payload bonito com:
- *  - Título, URL, preço
- *  - Marca, Tamanho, Estado
- *  - Favoritos, Visualizações
- *  - Rating e Nº avaliações
- *  - 3 imagens (1 no embed principal + 2 embeds só-imagem)
- *  - timestamp e vendedor no footer
+ * Faz download de uma imagem e devolve o Buffer.
  */
-export function buildDiscordPayload(item) {
+async function fetchImageBuffer(url) {
+  const res = await axios.get(url, { responseType: "arraybuffer" });
+  return Buffer.from(res.data);
+}
+
+/**
+ * Cria uma colagem (1 imagem grande + 2 pequenas à direita)
+ * para simular o layout visual do Vinted no Discord.
+ */
+export async function makeCollage3(images = []) {
+  const escolhidas = images.slice(0, 3);
+  if (escolhidas.length === 0) return null;
+
+  const LARGURA = 768; // 512 + 256
+  const ALTURA = 512;
+
+  const base = sharp({
+    create: { width: LARGURA, height: ALTURA, channels: 3, background: "#2b2d31" }
+  }).png();
+
+  const composições = [];
+
+  // imagem principal à esquerda
+  if (escolhidas[0]) {
+    const buf1 = await fetchImageBuffer(escolhidas[0]);
+    const img1 = await sharp(buf1).resize(512, 512, { fit: "cover" }).toBuffer();
+    composições.push({ input: img1, left: 0, top: 0 });
+  }
+
+  // imagem secundária (topo direita)
+  if (escolhidas[1]) {
+    const buf2 = await fetchImageBuffer(escolhidas[1]);
+    const img2 = await sharp(buf2).resize(256, 256, { fit: "cover" }).toBuffer();
+    composições.push({ input: img2, left: 512, top: 0 });
+  }
+
+  // imagem terciária (base direita)
+  if (escolhidas[2]) {
+    const buf3 = await fetchImageBuffer(escolhidas[2]);
+    const img3 = await sharp(buf3).resize(256, 256, { fit: "cover" }).toBuffer();
+    composições.push({ input: img3, left: 512, top: 256 });
+  }
+
+  const buffer = await base.composite(composições).png().toBuffer();
+  return { buffer, filename: "colagem.png" };
+}
+
+/**
+ * Constrói o embed completo do Discord.
+ * Totalmente em português de Portugal.
+ */
+export function buildDiscordPayload(item, opts = {}) {
   const {
     title,
     url,
-    priceLabel,
+    priceText,
     brand,
     size,
     condition,
+    favorites,
+    views,
     sellerName,
-    sellerRating, // número tipo 4.8
-    sellerReviews, // inteiro
-    favorites, // inteiro
-    views, // inteiro
-    images = [], // array de urls
-    detectedAtISO // string ISO
+    sellerRating,
+    sellerReviews,
+    detectedAtISO,
+    images = []
   } = item;
 
-  const mainImage = images[0] || null;
-  const extra1 = images[1] || null;
-  const extra2 = images[2] || null;
+  const cor = 0x2b8a3e; // verde Vinted / GRANITO
 
-  const fields = [];
+  const campos = [
+    { name: "📅 Publicado", value: `<t:${Math.floor(new Date(detectedAtISO).getTime()/1000)}:R>`, inline: true },
+    { name: "🏷️ Marca", value: brand || "—", inline: true },
+    { name: "📏 Tamanho", value: size || "—", inline: true },
+    { name: "💰 Preço", value: priceText || "—", inline: true },
+    { name: "⭐ Avaliações", value: `${sellerRating ?? "—"} ★ (${sellerReviews ?? 0})`, inline: true },
+    { name: "💎 Estado", value: condition || "—", inline: true },
+    { name: "❤️ Favoritos", value: String(favorites ?? "—"), inline: true },
+    { name: "👀 Visualizações", value: String(views ?? "—"), inline: true }
+  ];
 
-  if (priceLabel) fields.push({ name: "💶 Preço", value: cut(priceLabel, 256), inline: true });
-  if (brand) fields.push({ name: "🏷️ Marca", value: cut(brand, 256), inline: true });
-  if (size) fields.push({ name: "📏 Tamanho", value: cut(size, 256), inline: true });
-  if (condition) fields.push({ name: "✨ Estado", value: cut(condition, 256), inline: true });
-
-  if (favorites != null) fields.push({ name: "❤️ Favoritos", value: String(favorites), inline: true });
-  if (views != null) fields.push({ name: "👀 Visualizações", value: String(views), inline: true });
-
-  const ratingParts = [];
-  if (sellerRating != null) ratingParts.push(`★ ${Number(sellerRating).toFixed(1)}`);
-  if (sellerReviews != null) ratingParts.push(`${sellerReviews} avaliações`);
-  if (ratingParts.length) fields.push({ name: "⭐ Rating do vendedor", value: ratingParts.join(" • "), inline: true });
-
-  const embedMain = {
-    title: cut(title || "Item Vinted", 256),
-    url: url || undefined,
-    description: undefined, // opcional
-    color: 0x2b8a3e, // verde
-    timestamp: detectedAtISO || new Date().toISOString(),
-    fields: fields.slice(0, 25),
-    footer: {
-      text: sellerName ? cut(`Vendedor: ${sellerName}`, 2048) : "Vinted",
-    },
+  const embed = {
+    color: cor,
+    title: title?.trim() || "Novo artigo no Vinted",
+    url,
+    fields: campos,
+    author: sellerName ? { name: sellerName } : undefined,
+    footer: { text: "GRANITO — Seller Oficial da Comunidade" },
+    timestamp: detectedAtISO || new Date().toISOString()
   };
 
-  if (mainImage) {
-    // imagem grande; thumbnail também ajuda
-    embedMain.image = { url: mainImage };
-    embedMain.thumbnail = { url: mainImage };
+  // imagem grande (colagem ou foto principal)
+  const usarColagem = opts.usarColagem !== false;
+  if (usarColagem && images.length > 0) {
+    embed.image = { url: "attachment://colagem.png" };
+  } else if (images[0]) {
+    embed.image = { url: images[0] };
   }
 
-  const embeds = [embedMain];
-
-  // até mais 2 imagens extra (cada embed pode ter 1 image)
-  if (extra1) embeds.push({ image: { url: extra1 }, color: 0x2b8a3e });
-  if (extra2) embeds.push({ image: { url: extra2 }, color: 0x2b8a3e });
-
-  return { embeds };
-}
-
-/** Envia o payload para o webhook */
-export async function postToDiscord(webhookUrl, payload) {
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Falha no webhook Discord: ${res.status} ${res.statusText} ${text}`);
-  }
+  return { embeds: [embed] };
 }
