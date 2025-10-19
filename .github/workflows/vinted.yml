@@ -1,33 +1,36 @@
-name: vinted
+name: Vinted Monitor
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # a cada 30 min
+    - cron: "*/15 * * * *" # a cada 15 minutos
   workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: read
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-
+    env:
+      REPO: ${{ github.repository }}
+      # EDITA aqui os perfis (se precisares)
+      VINTED_PROFILE_URLS: https://www.vinted.pt/member/278727725,https://www.vinted.pt/member/145212065,https://www.vinted.pt/member/286788912,https://www.vinted.pt/member/238602833
+      ONLY_NEWER_HOURS: "24"
+      MAX_ITEMS_PER_PROFILE: "10"
+      MAX_NEW_PER_PROFILE: "5"
+      TEST_MODE: "false"
+      WEBHOOK_STYLE: "" # reservado
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Recuperar o estado da última run (para não repetir posts)
-      - name: Restore last vinted_state.json artifact (if any)
-        shell: bash --noprofile --norc -e -o pipefail {0}
+      # Recupera o estado anterior (vinted_state.json) do artefacto mais recente
+      - name: Restaurar estado (artefacto)
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
         run: |
           set -e
           echo "Procurar artefacto 'vinted-state' mais recente..."
@@ -40,30 +43,28 @@ jobs:
           else
             echo "Sem artefactos anteriores."
           fi
-
-      - name: Ensure default state
-        run: |
+          # se por algum motivo não existir, cria um de raiz
           if [ ! -f "vinted_state.json" ]; then
             echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
           fi
           echo "State file:"
           cat vinted_state.json
 
-      - name: Install deps
-        run: npm ci || npm i
+      - name: Instalar dependências
+        run: npm ci || npm install --no-audit --no-fund
 
-      - name: Run scraper
+      - name: Executar monitor
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # separa por vírgulas
-          VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
-          ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 24 }}
-          MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || 10 }}
-          MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || 5 }}
-          TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
+          VINTED_PROFILE_URLS: ${{ env.VINTED_PROFILE_URLS }}
+          ONLY_NEWER_HOURS: ${{ env.ONLY_NEWER_HOURS }}
+          MAX_ITEMS_PER_PROFILE: ${{ env.MAX_ITEMS_PER_PROFILE }}
+          MAX_NEW_PER_PROFILE: ${{ env.MAX_NEW_PER_PROFILE }}
+          TEST_MODE: ${{ env.TEST_MODE }}
+          WEBHOOK_STYLE: ${{ env.WEBHOOK_STYLE }}
         run: node index.js
 
-      - name: Upload vinted_state.json
+      - name: Guardar estado como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: vinted-state
