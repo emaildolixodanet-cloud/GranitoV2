@@ -10,8 +10,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       REPO: emaildolixodanet-cloud/GranitoV2
+      # Podes deixar estes valores fixos aqui OU usar GitHub Variables no repo
       VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
-      ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 12 }}
+      ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 24 }}
       MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || 10 }}
       MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || 5 }}
       TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
@@ -42,25 +43,27 @@ jobs:
           else
             echo "Sem artefactos anteriores."
           fi
-          # se por algum motivo não existir, cria um de raiz
+          # Se não existir, cria um estado de raiz
           if [ ! -f "vinted_state.json" ]; then
             echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
           fi
           echo "State file:"
           cat vinted_state.json
 
-      - name: Instalar dependências (condicional)
+      # === FIX DEFINITIVO AO TEU ERRO ===
+      # Ignora qualquer package-lock.json e instala a partir do package.json
+      - name: Instalar dependências SEM lock
         run: |
           set -e
-          if [ -f package-lock.json ]; then
-            echo "Temos package-lock.json -> npm ci"
-            npm ci
-          else
-            echo "Sem package-lock.json -> npm install (silencioso)"
-            npm install --no-audit --no-fund
-          fi
+          rm -f package-lock.json npm-shrinkwrap.json
+          npm install --no-audit --no-fund
 
-      - name: Executar
+      # (Opcional) reduzir timeouts falsos do Puppeteer
+      - name: Ajustes de runtime (opcional)
+        run: |
+          echo "Puppeteer a usar Chromium default; se precisares de mais tolerância, trata no código com setDefaultNavigationTimeout(60000)."
+
+      - name: Executar monitor
         run: node index.js
 
       - name: Guardar artefacto de estado
