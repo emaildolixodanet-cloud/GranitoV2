@@ -11,7 +11,7 @@ jobs:
     env:
       REPO: emaildolixodanet-cloud/GranitoV2
       VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
-      ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 24 }}
+      ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 12 }}
       MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || 10 }}
       MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || 5 }}
       TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
