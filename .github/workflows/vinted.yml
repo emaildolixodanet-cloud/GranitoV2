@@ -1,36 +1,35 @@
-name: Vinted Monitor
+name: run
 
 on:
-  schedule:
-    - cron: "*/15 * * * *" # a cada 15 minutos
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
 jobs:
   run:
     runs-on: ubuntu-24.04
     env:
-      REPO: ${{ github.repository }}
-      # EDITA aqui os perfis (se precisares)
-      VINTED_PROFILE_URLS: https://www.vinted.pt/member/278727725,https://www.vinted.pt/member/145212065,https://www.vinted.pt/member/286788912,https://www.vinted.pt/member/238602833
-      ONLY_NEWER_HOURS: "24"
-      MAX_ITEMS_PER_PROFILE: "10"
-      MAX_NEW_PER_PROFILE: "5"
-      TEST_MODE: "false"
-      WEBHOOK_STYLE: "" # reservado
+      REPO: emaildolixodanet-cloud/GranitoV2
+      VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
+      ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 24 }}
+      MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || 10 }}
+      MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || 5 }}
+      TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
+      WEBHOOK_STYLE: ${{ vars.WEBHOOK_STYLE }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Recupera o estado anterior (vinted_state.json) do artefacto mais recente
-      - name: Restaurar estado (artefacto)
-        shell: bash
+      - name: Restaurar artefacto de estado (se existir)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           echo "Procurar artefacto 'vinted-state' mais recente..."
@@ -50,23 +49,25 @@ jobs:
           echo "State file:"
           cat vinted_state.json
 
-      - name: Instalar dependências
-        run: npm ci || npm install --no-audit --no-fund
+      - name: Instalar dependências (condicional)
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            echo "Temos package-lock.json -> npm ci"
+            npm ci
+          else
+            echo "Sem package-lock.json -> npm install (silencioso)"
+            npm install --no-audit --no-fund
+          fi
 
-      - name: Executar monitor
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          VINTED_PROFILE_URLS: ${{ env.VINTED_PROFILE_URLS }}
-          ONLY_NEWER_HOURS: ${{ env.ONLY_NEWER_HOURS }}
-          MAX_ITEMS_PER_PROFILE: ${{ env.MAX_ITEMS_PER_PROFILE }}
-          MAX_NEW_PER_PROFILE: ${{ env.MAX_NEW_PER_PROFILE }}
-          TEST_MODE: ${{ env.TEST_MODE }}
-          WEBHOOK_STYLE: ${{ env.WEBHOOK_STYLE }}
+      - name: Executar
         run: node index.js
 
-      - name: Guardar estado como artefacto
+      - name: Guardar artefacto de estado
         uses: actions/upload-artifact@v4
         with:
           name: vinted-state
           path: vinted_state.json
           retention-days: 60
+          if-no-files-found: warn
+          compression-level: 6
