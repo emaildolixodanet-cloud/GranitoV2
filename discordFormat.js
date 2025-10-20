@@ -1,54 +1,55 @@
-// Formatação do embed em PT-PT, com rodapé pedido
-export function buildEmbedsPT(item, detectedAtIso) {
-  const {
-    title,
-    url,
-    priceText,
-    priceConvertedText,
-    brand,
-    size,
-    condition,
-    images = [],
-    seller,
-    favourites,
-    views,
-    rating,
-    reviews
-  } = item;
+/**
+ * Formatação dos embeds do Discord — visual limpo, PT-PT
+ * Sem cabeçalhos desnecessários. Um único embed rico.
+ */
 
+export function buildEmbedsPT(item, detectedAtIso) {
   const fields = [];
 
-  if (brand) fields.push({ name: "Marca", value: brand, inline: true });
-  if (size) fields.push({ name: "Tamanho", value: size, inline: true });
-  if (condition) fields.push({ name: "Estado", value: condition, inline: true });
+  if (item.priceText) fields.push({ name: "Preço", value: item.priceText, inline: true });
+  if (item.brand)     fields.push({ name: "Marca", value: item.brand, inline: true });
+  if (item.size)      fields.push({ name: "Tamanho", value: item.size, inline: true });
+  if (item.condition) fields.push({ name: "Estado", value: item.condition, inline: true });
+  if (item.seller)    fields.push({ name: "Vendedor", value: item.seller, inline: true });
 
-  if (favourites != null) fields.push({ name: "Favoritos", value: String(favourites), inline: true });
-  if (views != null) fields.push({ name: "Visualizações", value: String(views), inline: true });
+  const stats = [];
+  if (Number.isFinite(item.favourites)) stats.push(`❤️ ${item.favourites}`);
+  if (Number.isFinite(item.views))      stats.push(`👁️ ${item.views}`);
+  if (Number.isFinite(item.rating)) {
+    const stars = "⭐".repeat(Math.max(1, Math.min(5, Math.round(item.rating))));
+    const r = item.reviews ? ` (${item.reviews})` : "";
+    stats.push(`${stars}${r}`);
+  }
+  if (stats.length) fields.push({ name: "Popularidade", value: stats.join("   "), inline: false });
 
-  if (rating != null) fields.push({ name: "Rating do vendedor", value: `${rating.toFixed(1)} ★`, inline: true });
-  if (reviews != null) fields.push({ name: "N.º de avaliações", value: String(reviews), inline: true });
+  // imagem principal e thumbnail
+  const images = Array.isArray(item.images) ? item.images.filter(Boolean) : [];
+  const image = images[0] || null;
+  const thumb = images[1] || images[0] || null;
 
-  // Preço
-  const priceLine = [priceText, priceConvertedText].filter(Boolean).join("  |  ");
+  const detected = new Date(detectedAtIso);
+  const dd = String(detected.getDate()).padStart(2, "0");
+  const mm = String(detected.getMonth() + 1).padStart(2, "0");
+  const yyyy = detected.getFullYear();
+  const hh = String(detected.getHours()).padStart(2, "0");
+  const min = String(detected.getMinutes()).padStart(2, "0");
+  const footerText = `Vinted • Detetado às ${hh}:${min} de ${dd}/${mm}/${yyyy}`;
 
-  const baseEmbed = {
-    title: title || "Novo item no Vinted",
-    url,
-    description: priceLine || undefined,
-    color: 0x2b90d9,
+  // cor: verde-água (teal)
+  const color = 0x00b3a4;
+
+  const embed = {
+    title: item.title || "Novo artigo",
+    url: item.url,
+    description: "", // manter limpo
+    color,
     fields,
-    timestamp: detectedAtIso,
-    author: seller ? { name: seller } : undefined,
-    footer: { text: "GRANITO - Seller Oficial da Comunidade" }
+    footer: { text: footerText },
+    timestamp: detectedAtIso
   };
 
-  const embeds = [baseEmbed];
+  if (thumb) embed.thumbnail = { url: thumb };
+  if (image) embed.image = { url: image };
 
-  // até 3 imagens (1 principal + 2 adicionais). Discord permite 1 imagem por embed
-  const imgs = images.slice(0, 3);
-  if (imgs[0]) embeds[0].image = { url: imgs[0] };
-  if (imgs[1]) embeds.push({ image: { url: imgs[1] } });
-  if (imgs[2]) embeds.push({ image: { url: imgs[2] } });
-
-  return embeds;
+  return [embed];
 }
