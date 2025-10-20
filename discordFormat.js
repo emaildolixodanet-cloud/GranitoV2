@@ -1,55 +1,65 @@
 /**
- * Formatação dos embeds do Discord — visual limpo, PT-PT
- * Sem cabeçalhos desnecessários. Um único embed rico.
+ * Formatação dos embeds em PT-PT, visual limpo e consistente.
+ * – Título clicável
+ * – Preço em destaque
+ * – Campos compactos (Marca/Tamanho/Estado)
+ * – Rodapé e timestamp
  */
 
 export function buildEmbedsPT(item, detectedAtIso) {
+  const {
+    title = "Sem título",
+    url,
+    priceText = "",
+    priceConvertedText = "",
+    images = [],
+    brand = "",
+    size = "",
+    condition = "",
+    seller = "",
+    favourites,
+    views,
+    rating,
+    reviews,
+  } = item;
+
   const fields = [];
 
-  if (item.priceText) fields.push({ name: "Preço", value: item.priceText, inline: true });
-  if (item.brand)     fields.push({ name: "Marca", value: item.brand, inline: true });
-  if (item.size)      fields.push({ name: "Tamanho", value: item.size, inline: true });
-  if (item.condition) fields.push({ name: "Estado", value: item.condition, inline: true });
-  if (item.seller)    fields.push({ name: "Vendedor", value: item.seller, inline: true });
+  if (brand) fields.push({ name: "Marca", value: brand, inline: true });
+  if (size) fields.push({ name: "Tamanho", value: size, inline: true });
+  if (condition) fields.push({ name: "Estado", value: condition, inline: true });
 
   const stats = [];
-  if (Number.isFinite(item.favourites)) stats.push(`❤️ ${item.favourites}`);
-  if (Number.isFinite(item.views))      stats.push(`👁️ ${item.views}`);
-  if (Number.isFinite(item.rating)) {
-    const stars = "⭐".repeat(Math.max(1, Math.min(5, Math.round(item.rating))));
-    const r = item.reviews ? ` (${item.reviews})` : "";
-    stats.push(`${stars}${r}`);
+  if (typeof favourites === "number") stats.push(`❤ ${favourites}`);
+  if (typeof views === "number") stats.push(`👁 ${views}`);
+  if (typeof rating === "number") {
+    const r = reviews ? `${rating.toFixed(1)}★ · ${reviews}` : `${rating.toFixed(1)}★`;
+    stats.push(r);
   }
-  if (stats.length) fields.push({ name: "Popularidade", value: stats.join("   "), inline: false });
 
-  // imagem principal e thumbnail
-  const images = Array.isArray(item.images) ? item.images.filter(Boolean) : [];
-  const image = images[0] || null;
-  const thumb = images[1] || images[0] || null;
+  const descLines = [];
+  if (seller) descLines.push(`**Vendedor:** ${seller}`);
+  if (stats.length) descLines.push(stats.join("  •  "));
+  if (priceConvertedText) descLines.push(`≈ ${priceConvertedText}`);
 
-  const detected = new Date(detectedAtIso);
-  const dd = String(detected.getDate()).padStart(2, "0");
-  const mm = String(detected.getMonth() + 1).padStart(2, "0");
-  const yyyy = detected.getFullYear();
-  const hh = String(detected.getHours()).padStart(2, "0");
-  const min = String(detected.getMinutes()).padStart(2, "0");
-  const footerText = `Vinted • Detetado às ${hh}:${min} de ${dd}/${mm}/${yyyy}`;
-
-  // cor: verde-água (teal)
-  const color = 0x00b3a4;
+  // Imagem principal
+  const image = images?.[0];
 
   const embed = {
-    title: item.title || "Novo artigo",
-    url: item.url,
-    description: "", // manter limpo
-    color,
+    title,
+    url,
+    description: descLines.join("\n"),
+    color: 0x00b894, // verde suave
     fields,
-    footer: { text: footerText },
-    timestamp: detectedAtIso
+    thumbnail: image ? { url: image } : undefined,
+    footer: { text: "GRANITO • Monitor Vinted (PT)" },
+    timestamp: detectedAtIso,
   };
 
-  if (thumb) embed.thumbnail = { url: thumb };
-  if (image) embed.image = { url: image };
+  // Preço destacado no topo, se existir
+  if (priceText) {
+    embed.author = { name: priceText };
+  }
 
   return [embed];
 }
