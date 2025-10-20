@@ -1,33 +1,66 @@
 // discord_webhook.js
-// Envio robusto para webhook (JSON) com retry/backoff
+// Envio robusto de payloads (webhook) com backoff, sem dependências perigosas.
 
-import axios from "axios";
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+import https from "https";
+import { URL } from "url";
 
 /**
- * Envia payload para webhook do Discord (JSON apenas).
+ * Envia um payload JSON para um Webhook Discord.
  * @param {string} webhookUrl
- * @param {object} payload { username, avatar_url, content, embeds: [...] }
+ * @param {object} body
+ * @param {number} [tentativas=3]
  */
-export async function sendDiscord(webhookUrl, payload) {
-  if (!webhookUrl) throw new Error("DISCORD_WEBHOOK_URL em falta.");
-  const tries = 3;
-  let last;
+export function enviarWebhook(webhookUrl, body, tentativas = 3) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(webhookUrl);
+    const data = Buffer.from(JSON.stringify(body), "utf8");
 
-  for (let i = 1; i <= tries; i++) {
-    try {
-      const res = await axios.post(webhookUrl, payload, {
-        headers: { "Content-Type": "application/json" },
-        timeout: 20_000,
-        maxRedirects: 0,
-        validateStatus: s => s >= 200 && s < 300
+    const opts = {
+      method: "POST",
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": data.length,
+        "User-Agent": "GranitoBot/1.0",
+      },
+      timeout: 15000,
+    };
+
+    const req = https.request(opts, (res) => {
+      let chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const txt = Buffer.concat(chunks).toString("utf8");
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ ok: true, status: res.statusCode, body: txt });
+        } else if (res.statusCode === 429 && tentativas > 0) {
+          // Rate limit
+          const retryAfter = Number(res.headers["retry-after"] || 1);
+          setTimeout(() => {
+            enviarWebhook(webhookUrl, body, tentativas - 1).then(resolve).catch(reject);
+          }, Math.min(retryAfter * 1000, 5000));
+        } else {
+          reject(new Error(`Discord respondeu ${res.statusCode}: ${txt}`));
+        }
       });
-      return res?.data ?? true;
-    } catch (e) {
-      last = e;
-      if (i < tries) await sleep(1500 * i);
-    }
-  }
-  throw last;
+    });
+
+    req.on("error", (err) => {
+      if (tentativas > 0) {
+        setTimeout(() => {
+          enviarWebhook(webhookUrl, body, tentativas - 1).then(resolve).catch(reject);
+        }, 1000);
+      } else {
+        reject(err);
+      }
+    });
+
+    req.on("timeout", () => {
+      req.destroy(new Error("Timeout no pedido de webhook"));
+    });
+
+    req.write(data);
+    req.end();
+  });
 }
