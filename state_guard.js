@@ -1,73 +1,66 @@
 // state_guard.js
-// Filtro de anúncios antigos + anti-repost persistente.
+// Guarda simples para evitar republicar anúncios já enviados nas últimas X horas.
+// Usa apenas o ficheiro vinted_state.json que já tens no runner.
 
-import fs from "fs";
+import fs from "fs/promises";
 
-const STATE_PATH = process.env.STATE_FILE || "vinted_state.json";
-const HOURS_NEW = Number(process.env.ONLY_NEWER_HOURS || 24);
-const HOURS_REPOST = Number(process.env.ALLOW_REPOST_AFTER_HOURS || 72);
+const STATE_FILE = "vinted_state.json";
 
-function now() { return Date.now(); }
-function loadState() {
+/**
+ * Carrega o estado (se existir). Caso contrário devolve estrutura base.
+ */
+async function carregarEstado() {
   try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+    const raw = await fs.readFile(STATE_FILE, "utf8");
+    const json = JSON.parse(raw);
+    return json && typeof json === "object" ? json : { posted: {}, lastPrune: 0 };
   } catch {
     return { posted: {}, lastPrune: 0 };
   }
 }
-function saveState(st) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(st, null, 2));
-}
 
-function getItemId(item) {
-  if (item?.id) return String(item.id);
-  const m = (item?.url || "").match(/items\/(\d+)/);
-  return m?.[1] || null;
-}
-
-function toMs(t) {
-  if (!t) return null;
-  if (typeof t === "number") return t < 10_000_000_000 ? t * 1000 : t;
-  const d = new Date(t);
-  return isNaN(d) ? null : d.getTime();
+/**
+ * Guarda estado.
+ */
+async function guardarEstado(state) {
+  try {
+    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch {
+    // Ignora silenciosamente no runner
+  }
 }
 
 /**
- * Decide se devemos publicar um item.
- * Regras:
- *  - Se tiver data de criação e for mais antigo do que ONLY_NEWER_HOURS => não publica
- *  - Se já foi publicado e ainda não passou ALLOW_REPOST_AFTER_HOURS => não publica
- *  - Caso não haja data nenhuma: publica só se nunca foi publicado
+ * @param {string|number} itemId
+ * @param {number} janelaHoras — evita repetir dentro destas horas
+ * @returns {Promise<boolean>} — true se já foi publicado nesta janela
  */
-export function shouldPost(item, state = loadState()) {
-  const id = getItemId(item);
-  const createdMs = toMs(item?.created_at || item?.created || item?.upload_time || item?.published || item?.date);
+export async function jaPublicado(itemId, janelaHoras) {
+  const state = await carregarEstado();
+  const now = Date.now();
+  const entrada = state.posted[`item:${itemId}`];
 
-  const limitNewMs = now() - HOURS_NEW * 3600_000;
-  if (createdMs && createdMs < limitNewMs) {
-    return { ok: false, reason: "antigo" };
+  // Limpeza ocasional (1x/6h)
+  if (!state.lastPrune || now - state.lastPrune > 6 * 3600 * 1000) {
+    for (const k of Object.keys(state.posted)) {
+      const ts = state.posted[k]?.ts || 0;
+      if (now - ts > 7 * 24 * 3600 * 1000) delete state.posted[k];
+    }
+    state.lastPrune = now;
+    await guardarEstado(state);
   }
 
-  const key = id ? `item:${id}` : (item?.url || null);
-  if (!key) return { ok: false, reason: "sem-id" };
+  if (!entrada) return false;
 
-  const rec = state.posted[key];
-  if (rec && rec.ts && rec.ts > (now() - HOURS_REPOST * 3600_000)) {
-    return { ok: false, reason: "repost" };
-  }
-
-  return { ok: true, reason: "novo", key };
+  const janelaMs = Math.max(1, Number(janelaHoras)) * 3600 * 1000;
+  return now - (entrada.ts || 0) < janelaMs;
 }
 
-export function markPosted(key, url, state = loadState()) {
-  state.posted[key] = { ts: now(), url: url || null };
-  // limpeza a cada 7 dias
-  if (!state.lastPrune || (now() - state.lastPrune) > 7 * 24 * 3600_000) {
-    const cutoff = now() - 30 * 24 * 3600_000;
-    for (const k of Object.keys(state.posted)) {
-      if (!state.posted[k]?.ts || state.posted[k].ts < cutoff) delete state.posted[k];
-    }
-    state.lastPrune = now();
-  }
-  saveState(state);
+/**
+ * Marca como publicado agora.
+ */
+export async function marcaPublicado(itemId, url = "") {
+  const state = await carregarEstado();
+  state.posted[`item:${itemId}`] = { ts: Date.now(), url };
+  await guardarEstado(state);
 }
