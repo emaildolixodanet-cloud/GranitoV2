@@ -3,20 +3,34 @@ name: run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *" # a cada 30 minutos
+
+# Evita corridas em paralelo (duplica posts)
+concurrency:
+  group: vinted-discord
+  cancel-in-progress: true
+
+# Garante permissões para ler artefactos e o repo
+permissions:
+  actions: read
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     env:
+      NODE_ENV: production
       REPO: emaildolixodanet-cloud/GranitoV2
-      # Podes deixar estes valores fixos aqui OU usar GitHub Variables no repo
+
+      # Variáveis do repositório (Settings → Variables)
       VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
       ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 24 }}
       MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || 10 }}
       MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || 5 }}
       TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
-      WEBHOOK_STYLE: ${{ vars.WEBHOOK_STYLE }}
+
+      # Secret com o webhook do Discord (Settings → Secrets)
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
@@ -50,21 +64,18 @@ jobs:
           echo "State file:"
           cat vinted_state.json
 
-      # === FIX DEFINITIVO AO TEU ERRO ===
-      # Ignora qualquer package-lock.json e instala a partir do package.json
-      - name: Instalar dependências SEM lock
+      # Instalação limpa — ignora locks para evitar o erro do npm ci
+      - name: Instalar dependências (sem lock)
         run: |
           set -e
           rm -f package-lock.json npm-shrinkwrap.json
           npm install --no-audit --no-fund
 
-      # (Opcional) reduzir timeouts falsos do Puppeteer
-      - name: Ajustes de runtime (opcional)
+      # Executa com uma pequena tentativa extra em caso de timeout pontual
+      - name: Executar monitor (com 1 retry leve)
         run: |
-          echo "Puppeteer a usar Chromium default; se precisares de mais tolerância, trata no código com setDefaultNavigationTimeout(60000)."
-
-      - name: Executar monitor
-        run: node index.js
+          set -e
+          node index.js || (echo "⚠️ 1ª tentativa falhou, a repetir uma vez..." && sleep 5 && node index.js)
 
       - name: Guardar artefacto de estado
         uses: actions/upload-artifact@v4
