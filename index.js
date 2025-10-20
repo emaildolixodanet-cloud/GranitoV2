@@ -4,7 +4,8 @@ try { await import('dotenv/config'); } catch {}
 /**
  * Monitor Vinted → Publicar no Discord
  * - Totalmente em PT-PT
- * - Sem usar page.waitForTimeout (incompatível com Puppeteer 22+)
+ * - Robusto contra timeouts (goto com retry)
+ * - Não usa waits “mágicos” quebradiços
  */
 
 import fs from "fs";
@@ -19,7 +20,7 @@ const {
   ONLY_NEWER_HOURS = "24",
   MAX_ITEMS_PER_PROFILE = "10",
   MAX_NEW_PER_PROFILE = "5",
-  TEST_MODE = "false"
+  TEST_MODE = "false",
 } = process.env;
 
 if (!DISCORD_WEBHOOK_URL) {
@@ -29,24 +30,64 @@ if (!DISCORD_WEBHOOK_URL) {
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Ir para URL com retry e timeouts mais folgados */
+async function gotoWithRetry(page, url, { tries = 2, timeout = 60000, waitUntil = "domcontentloaded" } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      await page.goto(url, { timeout, waitUntil });
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) {
+        await delay(2000);
+        continue;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/** Tenta aceitar cookies em vários idiomas/variantes */
+async function tryAcceptCookies(page) {
+  const candidates = [
+    'button[aria-label*="Aceitar"]',
+    'button:has-text("Aceitar todos")',
+    'button:has-text("Concordo")',
+    'button:has-text("Accept all")',
+    'button:has-text("Allow all")',
+    '[data-testid="privacy-accept"] button',
+  ];
+  for (const sel of candidates) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click({ delay: 10 }); await delay(300); return; }
+    } catch {}
+  }
+}
+
+/** Recolhe links de itens de um perfil */
 async function getProfileItemLinks(page, profileUrl, max) {
-  await page.goto(profileUrl, { waitUntil: "networkidle0" });
-  // tenta aceitar cookies, se existir
-  try {
-    const btnSel = 'button:has-text("Aceitar todos")';
-    await page.waitForSelector(btnSel, { timeout: 3000 });
-    const btn = await page.$(btnSel);
-    if (btn) await btn.click();
-  } catch {}
-  // recolhe links para páginas de item
+  await gotoWithRetry(page, profileUrl, { tries: 2, timeout: 60000, waitUntil: "domcontentloaded" });
+  await tryAcceptCookies(page);
+
+  // Dar um “nudge” de scroll para renderizações preguiçosas
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+  await delay(300);
+
+  // Esperar até existirem anchors de items (sem bloquear eternamente)
+  try { await page.waitForSelector('a[href*="/items/"]', { timeout: 5000 }); } catch {}
+
   const links = await page.$$eval('a[href*="/items/"]', (as) =>
     Array.from(new Set(as.map((a) => a.href))).filter((u) => /\/items\/\d+/.test(u))
   );
+
   return links.slice(0, Number(max));
 }
 
+/** Scraping de uma página de item */
 async function scrapeItem(page, itemUrl) {
-  await page.goto(itemUrl, { waitUntil: "networkidle0" });
+  await gotoWithRetry(page, itemUrl, { tries: 2, timeout: 60000, waitUntil: "domcontentloaded" });
 
   const data = await page.evaluate(() => {
     const selText = (sel) => document.querySelector(sel)?.textContent?.trim() || "";
@@ -58,16 +99,14 @@ async function scrapeItem(page, itemUrl) {
     const price = document.querySelector('meta[property="product:price:amount"]')?.content || "";
     const currency = document.querySelector('meta[property="product:price:currency"]')?.content || "";
 
-    // Imagens
-    // tenta pegar da galeria (img com src)
-    const imgs = Array.from(document.querySelectorAll('img'))
+    // Imagens (galeria + og:image)
+    const imgs = Array.from(document.querySelectorAll("img"))
       .map((i) => i.getAttribute("src") || i.getAttribute("data-src") || "")
       .filter((u) => u && /^https?:\/\//.test(u));
-    // meta og:image como fallback
     const og = document.querySelector('meta[property="og:image"]')?.content;
     if (og && imgs.indexOf(og) === -1) imgs.unshift(og);
 
-    // Campos tipo tabela (Marca/Tamanho/Estado)
+    // Campos (Marca/Tamanho/Estado) – detecta por <dt>/<dd>
     const readFromDl = (label) => {
       const dts = Array.from(document.querySelectorAll("dt"));
       const dt = dts.find((x) => x.textContent?.trim().toLowerCase().includes(label.toLowerCase()));
@@ -75,23 +114,24 @@ async function scrapeItem(page, itemUrl) {
       const dd = dt.nextElementSibling;
       return dd ? dd.textContent.trim() : "";
     };
-
     const brand = readFromDl("marca") || readFromDl("brand");
     const size = readFromDl("tamanho") || readFromDl("size");
     const condition = readFromDl("estado") || readFromDl("condition");
 
-    // Vendedor (username)
+    // Vendedor
     const seller =
       document.querySelector('a[href*="/member/"] span')?.textContent?.trim() ||
       document.querySelector('a[href*="/member/"]')?.textContent?.trim() ||
       "";
 
-    // Favoritos / Visualizações (nem sempre exposto – tenta heurísticas)
+    // Heurísticas: favoritos / visualizações
     const favMatch = document.body.innerText.match(/Favoritos?\s*\(?(\d+)\)?/i);
     const viewsMatch = document.body.innerText.match(/Visualiza(?:ç|c)ões?\s*\(?(\d+)\)?/i);
 
-    // Rating e nº avaliações (quando existe)
-    const ratingMatch = document.body.innerText.match(/([\d,\.]+)\s*de\s*5\s*estrelas/i) || document.body.innerText.match(/([\d,\.]+)\s*★/);
+    // Classificação (quando aparece)
+    const ratingMatch =
+      document.body.innerText.match(/([\d,\.]+)\s*de\s*5\s*estrelas/i) ||
+      document.body.innerText.match(/([\d,\.]+)\s*★/);
     const reviewsMatch = document.body.innerText.match(/(\d+)\s+avalia(?:ç|c)ões/i);
 
     return {
@@ -106,41 +146,37 @@ async function scrapeItem(page, itemUrl) {
       favourites: favMatch ? Number(favMatch[1]) : null,
       views: viewsMatch ? Number(viewsMatch[1]) : null,
       rating: ratingMatch ? Number(String(ratingMatch[1]).replace(",", ".")) : null,
-      reviews: reviewsMatch ? Number(reviewsMatch[1]) : null
+      reviews: reviewsMatch ? Number(reviewsMatch[1]) : null,
     };
   });
 
-  // strings de preço
   const priceText = data.price && data.currency ? `${data.price} ${data.currency}` : "";
-  // sem conversões cambiais (mantemos simples e robusto)
-  const item = {
+
+  return {
     ...data,
     url: itemUrl,
     priceText,
-    priceConvertedText: "" // placeholder para manter layout
+    priceConvertedText: "",
   };
-
-  return item;
 }
 
+/** Controla duplicados/antigos via state */
 function shouldPost(itemUrl, state, onlyNewerHours) {
-  const key = `item:${(itemUrl.match(/\/items\/(\d+)/) || [])[1] || itemUrl}`;
+  const id = (itemUrl.match(/\/items\/(\d+)/) || [])[1] || itemUrl;
+  const key = `item:${id}`;
   const rec = state.posted[key];
   if (!rec) return { ok: true, key };
   const ageMs = Date.now() - Number(rec.ts || 0);
   return { ok: ageMs > onlyNewerHours * 3600 * 1000, key };
 }
-
-function markPosted(key, url, state) {
-  state.posted[key] = { ts: Date.now(), url };
-}
+function markPosted(key, url, state) { state.posted[key] = { ts: Date.now(), url }; }
 
 async function postToDiscord(webhookUrl, embeds) {
-  await axios.post(
-    webhookUrl,
-    { embeds },
-    { headers: { "Content-Type": "application/json" }, timeout: 20000 }
-  );
+  await axios.post(webhookUrl, { embeds }, {
+    headers: { "Content-Type": "application/json" },
+    timeout: 20000,
+    maxBodyLength: 10 * 1024 * 1024,
+  });
 }
 
 async function main() {
@@ -158,14 +194,25 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-features=site-per-process",
+    ],
   });
 
   try {
     const page = await browser.newPage();
+    await page.setDefaultNavigationTimeout(60000);
+    await page.setUserAgent(
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    );
+    await page.setViewport({ width: 1200, height: 900 });
 
     for (const profileUrl of profiles) {
       console.log(`→ Perfil: ${profileUrl}`);
+
       let links = [];
       try {
         links = await getProfileItemLinks(page, profileUrl, maxPerProfile);
@@ -196,9 +243,7 @@ async function main() {
           markPosted(key, link, state);
           newCount += 1;
           totalToPost += 1;
-
-          // pequena pausa entre posts para evitar rate limit
-          await delay(1000);
+          await delay(800);
         } catch (e) {
           console.log(`⚠️ Erro a scrapar ${link}: ${e.message}`);
         }
@@ -208,10 +253,10 @@ async function main() {
     await browser.close();
   }
 
-  // limpeza leve do state (a cada ~3 dias)
+  // Limpeza do state (30 dias)
   if (Date.now() - (state.lastPrune || 0) > 3 * 24 * 3600 * 1000) {
     const before = Object.keys(state.posted).length;
-    const cutoff = Date.now() - 30 * 24 * 3600 * 1000; // 30 dias
+    const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
     for (const k of Object.keys(state.posted)) {
       if (Number(state.posted[k]?.ts || 0) < cutoff) delete state.posted[k];
     }
