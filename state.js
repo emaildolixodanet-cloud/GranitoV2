@@ -4,25 +4,20 @@ const STATE_FILE = "vinted_state.json";
 
 export function loadState() {
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, "utf8");
-      const json = JSON.parse(raw);
-      // garantir estrutura mínima
-      return {
-        posted: json.posted || {},
-        lastPrune: json.lastPrune || 0
-      };
-    }
-  } catch (e) {
-    console.log("⚠️ Não foi possível ler o state, vou recriar. Motivo:", e.message);
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") throw new Error("invalid");
+    if (!obj.posted) obj.posted = {};
+    return obj;
+  } catch {
+    return { posted: {}, lastPrune: 0 };
   }
-  return { posted: {}, lastPrune: 0 };
 }
 
 export function saveState(state) {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (e) {
-    console.log("⚠️ Erro a guardar state:", e.message);
+    console.error("⚠️ Não foi possível guardar state:", e.message);
   }
 }
