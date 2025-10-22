@@ -1,7 +1,13 @@
-/* Carregar dotenv de forma OPCIONAL (não rebenta no GitHub Actions) */
+/* Carregar dotenv de forma OPCIONAL (seguro no Actions) */
 try { await import('dotenv/config'); } catch {}
 
-import fs from "fs";
+/**
+ * Monitor Vinted → Discord (PT-PT)
+ * - Visual “cartão” com ícones
+ * - Só publica itens *novos* (created_at_ts / datePublished) e nunca repete
+ * - Robusto a cookies/timeouts
+ */
+
 import axios from "axios";
 import puppeteer from "puppeteer";
 import { loadState, saveState } from "./state.js";
@@ -23,45 +29,90 @@ if (!DISCORD_WEBHOOK_URL) {
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function extractItemId(url) {
+  const m = url.match(/\/items\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+async function safeClickCookieButtons(page) {
+  const selectors = [
+    'button:has-text("Aceitar")',
+    'button:has-text("Aceitar todos")',
+    'button:has-text("Accept all")',
+    '[data-testid="consent-accept"] button',
+    'button[aria-label*="Aceitar"]'
+  ];
+  for (const sel of selectors) {
+    try {
+      const el = await page.$(sel);
+      if (el) { await el.click(); await delay(300); return; }
+    } catch {}
+  }
+}
+
 async function getProfileItemLinks(page, profileUrl, max) {
-  await page.goto(profileUrl, { waitUntil: "networkidle0" });
+  await page.goto(profileUrl, { waitUntil: "domcontentloaded" });
+  await safeClickCookieButtons(page);
 
-  // Aceitar cookies (se existir)
-  try {
-    const btnSel = 'button:has-text("Aceitar todos")';
-    await page.waitForSelector(btnSel, { timeout: 3000 });
-    const btn = await page.$(btnSel);
-    if (btn) await btn.click();
-  } catch {}
+  // carrega alguns cartões (scroll leve)
+  for (let i = 0; i < 4; i++) {
+    await page.evaluate(() => window.scrollBy(0, 1200));
+    await delay(250);
+  }
 
-  // recolhe links para páginas de item
   const links = await page.$$eval('a[href*="/items/"]', (as) =>
     Array.from(new Set(as.map((a) => a.href))).filter((u) => /\/items\/\d+/.test(u))
   );
+
   return links.slice(0, Number(max));
 }
 
+/**
+ * Extrai o created_at (epoch ms) de várias formas:
+ *  - JSON inline `"created_at_ts": 1712345678`
+ *  - script LD+JSON com "datePublished"
+ *  - meta[property=og:updated_time] como fallback (menos fiável)
+ */
+function extractCreatedAtMsFromHtml(html) {
+  // 1) created_at_ts (segundos)
+  let m = html.match(/"created_at_ts"\s*:\s*(\d{10})/);
+  if (m) return Number(m[1]) * 1000;
+
+  // 2) datePublished em LD+JSON
+  m = html.match(/"datePublished"\s*:\s*"([^"]+)"/i);
+  if (m) {
+    const d = Date.parse(m[1]);
+    if (!isNaN(d)) return d;
+  }
+
+  // 3) og:updated_time (pior fallback)
+  m = html.match(/property="og:updated_time"\s+content="(\d{10})"/i);
+  if (m) return Number(m[1]) * 1000;
+
+  return null;
+}
+
 async function scrapeItem(page, itemUrl) {
-  await page.goto(itemUrl, { waitUntil: "networkidle0" });
+  await page.goto(itemUrl, { waitUntil: "domcontentloaded" });
+
+  const html = await page.content();
+  const createdAt = extractCreatedAtMsFromHtml(html);
 
   const data = await page.evaluate(() => {
     const selText = (sel) => document.querySelector(sel)?.textContent?.trim() || "";
-
-    // Título
     const title = selText("h1");
 
-    // Preço via meta OG
+    // preço por meta OG
     const price = document.querySelector('meta[property="product:price:amount"]')?.content || "";
     const currency = document.querySelector('meta[property="product:price:currency"]')?.content || "";
 
-    // Imagens
-    const imgs = Array.from(document.querySelectorAll('img'))
+    // imagens (src/data-src)
+    const imgs = Array.from(document.querySelectorAll("img"))
       .map((i) => i.getAttribute("src") || i.getAttribute("data-src") || "")
       .filter((u) => u && /^https?:\/\//.test(u));
     const og = document.querySelector('meta[property="og:image"]')?.content;
-    if (og && imgs.indexOf(og) === -1) imgs.unshift(og);
+    if (og && !imgs.includes(og)) imgs.unshift(og);
 
-    // Campos tipo tabela
     const readFromDl = (label) => {
       const dts = Array.from(document.querySelectorAll("dt"));
       const dt = dts.find((x) => x.textContent?.trim().toLowerCase().includes(label.toLowerCase()));
@@ -74,83 +125,35 @@ async function scrapeItem(page, itemUrl) {
     const size = readFromDl("tamanho") || readFromDl("size");
     const condition = readFromDl("estado") || readFromDl("condition");
 
-    // Vendedor
-    let seller =
+    const seller =
       document.querySelector('a[href*="/member/"] span')?.textContent?.trim() ||
-      document.querySelector('a[href*="/member/"]')?.textContent?.trim() ||
-      "";
-    if (/criar conta/i.test(seller) || /iniciar sessão/i.test(seller)) seller = "";
+      document.querySelector('a[href*="/member/"]')?.textContent?.trim() || "";
 
-    // Favoritos/Visualizações (heurística)
-    const favMatch = document.body.innerText.match(/Favoritos?\s*\(?(\d+)\)?/i);
-    const viewsMatch = document.body.innerText.match(/Visualiza(?:ç|c)ões?\s*\(?(\d+)\)?/i);
-
-    // Rating e nº avaliações (quando existe)
-    const ratingMatch = document.body.innerText.match(/([\d,\.]+)\s*de\s*5\s*estrelas/i) || document.body.innerText.match(/([\d,\.]+)\s*★/);
-    const reviewsMatch = document.body.innerText.match(/(\d+)\s+avalia(?:ç|c)ões/i);
-
-    // Tentar obter data de publicação (JSON-LD ou metas comuns)
-    let publishedAtIso = "";
-    try {
-      const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-        .map(s => s.textContent || "")
-        .join("\n");
-      const m = ld.match(/"datePublished"\s*:\s*"([^"]+)"/i) || ld.match(/"uploadDate"\s*:\s*"([^"]+)"/i);
-      if (m) publishedAtIso = m[1];
-    } catch {}
-    if (!publishedAtIso) {
-      const metaTime = document.querySelector('meta[itemprop="datePublished"]')?.getAttribute("content")
-        || document.querySelector('meta[property="article:published_time"]')?.getAttribute("content")
-        || document.querySelector('meta[property="og:updated_time"]')?.getAttribute("content")
-        || "";
-      if (metaTime) publishedAtIso = metaTime;
-    }
-
-    return {
-      title,
-      price,
-      currency,
-      images: imgs.slice(0, 6),
-      brand,
-      size,
-      condition,
-      seller,
-      favourites: favMatch ? Number(favMatch[1]) : null,
-      views: viewsMatch ? Number(viewsMatch[1]) : null,
-      rating: ratingMatch ? Number(String(ratingMatch[1]).replace(",", ".")) : null,
-      reviews: reviewsMatch ? Number(reviewsMatch[1]) : null,
-      publishedAtIso
-    };
+    return { title, price, currency, images: imgs.slice(0, 6), brand, size, condition, seller };
   });
-
-  const priceText = data.price && data.currency ? `${data.price} ${data.currency}` : "";
 
   return {
     ...data,
     url: itemUrl,
-    priceText,
-    priceConvertedText: "" // sem conversões cambiais para robustez
+    id: extractItemId(itemUrl),
+    createdAt,
+    priceText: data.price && data.currency ? `${data.price} ${data.currency}` : ""
   };
 }
 
-function shouldPost(itemUrl, state, onlyNewerHours) {
-  const key = `item:${(itemUrl.match(/\/items\/(\d+)/) || [])[1] || itemUrl}`;
-  const rec = state.posted[key];
-  if (!rec) return { ok: true, key };
-  const ageMs = Date.now() - Number(rec.ts || 0);
-  return { ok: ageMs > onlyNewerHours * 3600 * 1000, key };
-}
+function shouldPost(item, state, onlyNewerHours) {
+  // só novos: precisa de createdAt e estar dentro da janela
+  if (!item.createdAt) return { ok: false, reason: "sem-createdAt" };
+  const freshCut = Date.now() - onlyNewerHours * 3600 * 1000;
+  if (item.createdAt < freshCut) return { ok: false, reason: "antigo" };
 
-function markPosted(key, url, state) {
-  state.posted[key] = { ts: Date.now(), url };
+  const key = item.id ? `item:${item.id}` : item.url;
+  if (state.posted[key]) return { ok: false, reason: "ja-postado" };
+  return { ok: true, key };
 }
 
 async function postToDiscord(webhookUrl, embeds) {
-  await axios.post(
-    webhookUrl,
-    { embeds },
-    { headers: { "Content-Type": "application/json" }, timeout: 20000 }
-  );
+  await axios.post(webhookUrl, { embeds }, { headers: { "Content-Type": "application/json" }, timeout: 20000 });
 }
 
 async function main() {
@@ -173,7 +176,8 @@ async function main() {
 
   try {
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60000); // mais tolerante no Actions
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(60000);
 
     for (const profileUrl of profiles) {
       console.log(`→ Perfil: ${profileUrl}`);
@@ -189,26 +193,26 @@ async function main() {
 
       let newCount = 0;
       for (const link of links) {
-        const { ok, key } = shouldPost(link, state, onlyNewerHours);
-        if (!ok) continue;
         if (newCount >= maxNewPerProfile) break;
 
         try {
           const item = await scrapeItem(page, link);
-          const detectedAtIso = new Date().toISOString();
-          const embeds = buildEmbedsPT(item, detectedAtIso);
+
+          const gate = shouldPost(item, state, onlyNewerHours);
+          if (!gate.ok) continue;
+
+          const embeds = buildEmbedsPT(item, new Date().toISOString());
 
           if (isTest) {
             console.log(`(TEST_MODE) Publicaria: ${item.title} -> ${item.url}`);
           } else {
             await postToDiscord(DISCORD_WEBHOOK_URL, embeds);
+            await delay(900); // ligeira pausa anti rate-limit
           }
 
-          markPosted(key, link, state);
+          state.posted[gate.key] = { ts: Date.now(), url: item.url };
           newCount += 1;
           totalToPost += 1;
-
-          await delay(1000);
         } catch (e) {
           console.log(`⚠️ Erro a scrapar ${link}: ${e.message}`);
         }
@@ -218,20 +222,19 @@ async function main() {
     await browser.close();
   }
 
-  // Prune leve
+  // prune de registos com mais de 30 dias (a cada ~3 dias)
   if (Date.now() - (state.lastPrune || 0) > 3 * 24 * 3600 * 1000) {
     const before = Object.keys(state.posted).length;
-    const cutoff = Date.now() - 30 * 24 * 3600 * 1000; // 30 dias
+    const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
     for (const k of Object.keys(state.posted)) {
       if (Number(state.posted[k]?.ts || 0) < cutoff) delete state.posted[k];
     }
-    const after = Object.keys(state.posted).length;
     state.lastPrune = Date.now();
-    console.log(`🧹 Prune: ${before} → ${after}`);
+    console.log(`🧹 Prune: ${before} → ${Object.keys(state.posted).length}`);
   }
 
   saveState(state);
-  console.log(`📦 Resumo: encontrados=${totalFound}, a_publicar=${totalToPost}`);
+  console.log(`📦 Resumo: encontrados=${totalFound}, publicados=${totalToPost}`);
 }
 
 main().catch((e) => {
