@@ -3,34 +3,18 @@ name: run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *" # a cada 30 minutos
-
-# Evita corridas em paralelo (duplica posts)
-concurrency:
-  group: vinted-discord
-  cancel-in-progress: true
-
-# Garante permissões para ler artefactos e o repo
-permissions:
-  actions: read
-  contents: read
+    - cron: "*/30 * * * *"
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
     env:
-      NODE_ENV: production
       REPO: emaildolixodanet-cloud/GranitoV2
-
-      # Variáveis do repositório (Settings → Variables)
       VINTED_PROFILE_URLS: ${{ vars.VINTED_PROFILE_URLS }}
       ONLY_NEWER_HOURS: ${{ vars.ONLY_NEWER_HOURS || 24 }}
       MAX_ITEMS_PER_PROFILE: ${{ vars.MAX_ITEMS_PER_PROFILE || 10 }}
       MAX_NEW_PER_PROFILE: ${{ vars.MAX_NEW_PER_PROFILE || 5 }}
       TEST_MODE: ${{ vars.TEST_MODE || 'false' }}
-
-      # Secret com o webhook do Discord (Settings → Secrets)
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
@@ -57,25 +41,21 @@ jobs:
           else
             echo "Sem artefactos anteriores."
           fi
-          # Se não existir, cria um estado de raiz
           if [ ! -f "vinted_state.json" ]; then
             echo '{"posted":{}, "lastPrune": 0}' > vinted_state.json
           fi
           echo "State file:"
           cat vinted_state.json
 
-      # Instalação limpa — ignora locks para evitar o erro do npm ci
+      # instala SEM lock para não rebentar
       - name: Instalar dependências (sem lock)
         run: |
           set -e
           rm -f package-lock.json npm-shrinkwrap.json
           npm install --no-audit --no-fund
 
-      # Executa com uma pequena tentativa extra em caso de timeout pontual
-      - name: Executar monitor (com 1 retry leve)
-        run: |
-          set -e
-          node index.js || (echo "⚠️ 1ª tentativa falhou, a repetir uma vez..." && sleep 5 && node index.js)
+      - name: Executar
+        run: node index.js
 
       - name: Guardar artefacto de estado
         uses: actions/upload-artifact@v4
